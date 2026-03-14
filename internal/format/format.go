@@ -255,10 +255,60 @@ func (f *Formatter) shortenFuncParams(fn *dst.FuncDecl) {
 // transformBlockStmt processes a block with increased indentation
 func (f *Formatter) transformBlockStmt(block *dst.BlockStmt) {
 	f.indent++
-	for _, stmt := range block.List {
+	// Process statements and simplify var declarations
+	for i, stmt := range block.List {
+		// Check for var x = value that can be simplified to x := value
+		if simplified := f.simplifyVarDecl(stmt); simplified != nil {
+			block.List[i] = simplified
+			continue
+		}
 		f.transformStmt(stmt)
 	}
 	f.indent--
+}
+
+// simplifyVarDecl converts var x = value to x := value inside functions.
+// Returns nil if the statement cannot be simplified.
+func (f *Formatter) simplifyVarDecl(stmt dst.Stmt) dst.Stmt {
+	// Must be a DeclStmt
+	declStmt, ok := stmt.(*dst.DeclStmt)
+	if !ok {
+		return nil
+	}
+
+	// Must be a GenDecl with VAR token
+	genDecl, ok := declStmt.Decl.(*dst.GenDecl)
+	if !ok || genDecl.Tok != token.VAR {
+		return nil
+	}
+
+	// Must have exactly one spec
+	if len(genDecl.Specs) != 1 {
+		return nil
+	}
+
+	// Must be a ValueSpec
+	valueSpec, ok := genDecl.Specs[0].(*dst.ValueSpec)
+	if !ok {
+		return nil
+	}
+
+	// Must have exactly one name and one value, and no type
+	if len(valueSpec.Names) != 1 || len(valueSpec.Values) != 1 || valueSpec.Type != nil {
+		return nil
+	}
+
+	// Create an AssignStmt with DEFINE
+	assign := &dst.AssignStmt{
+		Lhs: []dst.Expr{valueSpec.Names[0]},
+		Tok: token.DEFINE,
+		Rhs: []dst.Expr{valueSpec.Values[0]},
+	}
+	// Copy before/after decorations from the original statement
+	assign.Decs.Before = declStmt.Decs.Before
+	assign.Decs.After = declStmt.Decs.After
+
+	return assign
 }
 
 // transformStmt processes a statement with indentation context
@@ -370,6 +420,10 @@ func (f *Formatter) transformExpr(expr dst.Expr) {
 		f.transformExpr(e.Fun)
 	case *dst.CompositeLit:
 		f.shortenCompositeLit(e)
+		// Check if the type is an anonymous struct
+		if structType, ok := e.Type.(*dst.StructType); ok {
+			f.shortenAnonymousStruct(structType)
+		}
 		for _, elt := range e.Elts {
 			f.transformExpr(elt)
 		}
@@ -399,6 +453,8 @@ func (f *Formatter) transformExpr(expr dst.Expr) {
 		if e.Body != nil {
 			f.transformBlockStmt(e.Body)
 		}
+	case *dst.StructType:
+		f.shortenAnonymousStruct(e)
 	}
 }
 
@@ -871,10 +927,88 @@ func (f *Formatter) normalizeTypeSpec(ts *dst.TypeSpec) {
 	case *dst.StructType:
 		if t.Fields == nil || len(t.Fields.List) == 0 {
 			// Empty struct - already fine
+			return
 		}
+		f.shortenStructDef(ts, t)
 	case *dst.InterfaceType:
 		if t.Methods == nil || len(t.Methods.List) == 0 {
 			// Empty interface - already fine
+		}
+	}
+}
+
+// shortenStructDef splits long struct type definitions across multiple lines.
+func (f *Formatter) shortenStructDef(ts *dst.TypeSpec, structType *dst.StructType) {
+	if structType.Fields == nil || len(structType.Fields.List) == 0 {
+		return
+	}
+
+	// Estimate the width of the struct definition on a single line
+	// "type " + name + " struct { " + fields + " }"
+	width := 5 // "type "
+	if ts.Name != nil {
+		width += len(ts.Name.Name)
+	}
+	width += 10 // " struct { "
+	width += f.estimateStructFieldsWidth(structType)
+	width += 3 // " }"
+
+	// Add indentation
+	width += f.indent * f.opts.TabWidth
+
+	if width > f.opts.LineLength {
+		// Split each field onto its own line
+		for i, field := range structType.Fields.List {
+			if i == 0 {
+				field.Decorations().Before = dst.NewLine
+			}
+			field.Decorations().After = dst.NewLine
+		}
+	}
+}
+
+// estimateStructFieldsWidth estimates the width of struct fields.
+func (f *Formatter) estimateStructFieldsWidth(structType *dst.StructType) int {
+	width := 0
+	for i, field := range structType.Fields.List {
+		// Field names
+		for j, name := range field.Names {
+			width += len(name.Name)
+			if j < len(field.Names)-1 {
+				width += 2 // ", "
+			}
+		}
+		// Type
+		width += f.estimateNodeWidth(field.Type)
+		// Tag
+		if field.Tag != nil {
+			width += len(field.Tag.Value)
+		}
+		if i < len(structType.Fields.List)-1 {
+			width += 2 // "; "
+		}
+	}
+	return width
+}
+
+// shortenAnonymousStruct splits long anonymous struct types across multiple lines.
+func (f *Formatter) shortenAnonymousStruct(structType *dst.StructType) {
+	if structType.Fields == nil || len(structType.Fields.List) == 0 {
+		return
+	}
+
+	// Estimate width: "struct { " + fields + " }"
+	width := 10 // "struct { "
+	width += f.estimateStructFieldsWidth(structType)
+	width += 3 // " }"
+	width += f.indent * f.opts.TabWidth
+
+	if width > f.opts.LineLength {
+		for i, field := range structType.Fields.List {
+			if i == 0 {
+				field.Decorations().Before = dst.NewLine
+			}
+			field.Decorations().After = dst.NewLine
 		}
 	}
 }

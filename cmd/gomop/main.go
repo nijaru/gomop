@@ -150,16 +150,28 @@ func processPath(cli *CLI, path string) error {
 }
 
 func processDir(cli *CLI, dir string) error {
+	// Load ignore patterns from .gomopignore
+	ignore := newIgnoreMatcher(dir)
+
 	return godirwalk.Walk(dir, &godirwalk.Options{
 		Callback: func(path string, de *godirwalk.Dirent) error {
 			if de.IsDir() {
 				if de.Name() == "vendor" || de.Name() == "testdata" || strings.HasPrefix(de.Name(), ".") {
 					return filepath.SkipDir
 				}
+				// Check if directory matches ignore pattern
+				if ignore.match(path) {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 
 			if !strings.HasSuffix(path, ".go") {
+				return nil
+			}
+
+			// Check if file matches ignore pattern
+			if ignore.match(path) {
 				return nil
 			}
 
