@@ -27,6 +27,11 @@ go.work.sum
 # env file
 .env
 
+# Project specific
+goformat
+research.md
+testdata/
+
 # Editor/IDE
 # .idea/
 # .vscode/
