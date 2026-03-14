@@ -14,6 +14,7 @@ import (
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/karrick/godirwalk"
 	"github.com/nijaru/goformat/internal/format"
+	"github.com/nijaru/goformat/internal/stdlib"
 )
 
 var (
@@ -117,11 +118,16 @@ func main() {
 }
 
 func formatSource(cli *CLI, filename string, src []byte) ([]byte, error) {
+	modPath := cli.ModulePath
+	if modPath == "" && filename != "<stdin>" {
+		modPath = stdlib.FindModulePath(filename)
+	}
+
 	opts := format.Options{
 		LineLength:    cli.LineLength,
 		TabWidth:      cli.TabWidth,
 		GoVersion:     cli.GoVersion,
-		ModulePath:    cli.ModulePath,
+		ModulePath:    modPath,
 		LocalPrefixes: cli.LocalPrefixes,
 		ExtraRules:    cli.ExtraRules,
 		SkipTypeInfo:  cli.Fast,

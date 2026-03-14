@@ -445,6 +445,10 @@ func (f *Formatter) groupImports(specs []*dst.ImportSpec) []*dst.ImportSpec {
 	var std, thirdParty, local []*dst.ImportSpec
 
 	for _, spec := range specs {
+		// Clean up existing decorations to avoid carry-over newlines
+		spec.Decorations().Before = dst.None
+		spec.Decorations().After = dst.None
+
 		path := strings.Trim(spec.Path.Value, `"`)
 		if f.isStdLib(path) {
 			std = append(std, spec)
@@ -460,16 +464,19 @@ func (f *Formatter) groupImports(specs []*dst.ImportSpec) []*dst.ImportSpec {
 	sort.Slice(thirdParty, f.byPath(thirdParty))
 	sort.Slice(local, f.byPath(local))
 
-	// Combine with blank lines between groups
 	var result []*dst.ImportSpec
 	result = append(result, std...)
-	if len(thirdParty) > 0 && len(result) > 0 {
-		result[len(result)-1].Decorations().After = dst.NewLine
+
+	if len(std) > 0 && (len(thirdParty) > 0 || len(local) > 0) {
+		std[len(std)-1].Decorations().After = dst.EmptyLine
 	}
+
 	result = append(result, thirdParty...)
-	if len(local) > 0 && len(result) > 0 {
-		result[len(result)-1].Decorations().After = dst.NewLine
+
+	if len(thirdParty) > 0 && len(local) > 0 {
+		thirdParty[len(thirdParty)-1].Decorations().After = dst.EmptyLine
 	}
+
 	result = append(result, local...)
 
 	return result
