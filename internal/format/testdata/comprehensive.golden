@@ -10,7 +10,7 @@ import (
 func ProcessData(
 	inputData string,
 	outputBuffer *bytes.Buffer,
-	config map[string]interface{},
+	config map[string]any,
 	errorHandler func(error),
 	logger interface{ Log(string) },
 ) error {

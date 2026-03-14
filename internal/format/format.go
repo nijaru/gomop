@@ -58,7 +58,12 @@ type Formatter struct {
 	imports     map[string]*dst.ImportSpec // path -> spec
 	lineLengths []lineInfo                 // line length info from source
 	indent      int                        // current indentation level
+
+	// siblingCache caches globals from sibling files (directory -> globals)
+	siblingCache   map[string]map[string]bool
+	siblingCacheDir string
 }
+
 
 // New creates a new formatter.
 func New(opts Options) *Formatter {
@@ -69,13 +74,15 @@ func New(opts Options) *Formatter {
 		opts.TabWidth = 4
 	}
 	return &Formatter{
-		fset: token.NewFileSet(),
-		opts: opts,
+		fset:         token.NewFileSet(),
+		opts:         opts,
+		siblingCache: make(map[string]map[string]bool),
 	}
 }
 
 // Format formats source in a single pass.
-func (f *Formatter) Format(filename string, src []byte) ([]byte, error) { // Step 1: Parse into dst (preserves comments/decorations)
+func (f *Formatter) Format(filename string, src []byte) ([]byte, error) {
+	// Step 1: Parse into dst (preserves comments/decorations)
 	file, err := decorator.Parse(src)
 	if err != nil {
 		return nil, fmt.Errorf("parse: %w", err)
@@ -194,6 +201,9 @@ func (f *Formatter) transform(filename string, file *dst.File) { // Reset import
 
 	// Apply gofumpt-style rules
 	f.applyGofumptRules(file)
+
+	// Convert interface{} to any
+	f.convertEmptyInterfacesToAny(file)
 }
 
 // transformDecls processes declarations with indentation context
@@ -412,6 +422,8 @@ func (f *Formatter) transformStmt(stmt dst.Stmt) {
 // transformExpr processes an expression with indentation context
 func (f *Formatter) transformExpr(expr dst.Expr) {
 	switch e := expr.(type) {
+	case *dst.BasicLit:
+		f.transformBasicLit(e)
 	case *dst.CallExpr:
 		f.shortenCallExpr(e)
 		for _, arg := range e.Args {
@@ -455,7 +467,71 @@ func (f *Formatter) transformExpr(expr dst.Expr) {
 		}
 	case *dst.StructType:
 		f.shortenAnonymousStruct(e)
+	case *dst.InterfaceType:
+		// Empty interfaces are converted to 'any' in convertEmptyInterfacesToAny
 	}
+}
+
+// convertEmptyInterfacesToAny transforms interface{} to any throughout the file.
+func (f *Formatter) convertEmptyInterfacesToAny(file *dst.File) {
+	dst.Inspect(file, func(n dst.Node) bool {
+		switch node := n.(type) {
+		// Function parameters and results
+		case *dst.FuncDecl:
+			if node.Type != nil {
+				if node.Type.Params != nil {
+					for _, field := range node.Type.Params.List {
+						field.Type = f.toAnyIfEmptyInterface(field.Type)
+					}
+				}
+				if node.Type.Results != nil {
+					for _, field := range node.Type.Results.List {
+						field.Type = f.toAnyIfEmptyInterface(field.Type)
+					}
+				}
+			}
+		// Field lists (struct fields, interface methods)
+		case *dst.StructType:
+			if node.Fields != nil {
+				for _, field := range node.Fields.List {
+					field.Type = f.toAnyIfEmptyInterface(field.Type)
+				}
+			}
+		// Variable declarations
+		case *dst.ValueSpec:
+			if node.Type != nil {
+				node.Type = f.toAnyIfEmptyInterface(node.Type)
+			}
+		// Type declarations
+		case *dst.TypeSpec:
+			node.Type = f.toAnyIfEmptyInterface(node.Type)
+		// Type assertions
+		case *dst.TypeAssertExpr:
+			if node.Type != nil {
+				node.Type = f.toAnyIfEmptyInterface(node.Type)
+			}
+		// Map value types
+		case *dst.MapType:
+			node.Value = f.toAnyIfEmptyInterface(node.Value)
+		// Array/Slice element types
+		case *dst.ArrayType:
+			node.Elt = f.toAnyIfEmptyInterface(node.Elt)
+		// Chan element types
+		case *dst.ChanType:
+			node.Value = f.toAnyIfEmptyInterface(node.Value)
+		}
+		return true
+	})
+}
+
+// toAnyIfEmptyInterface returns an 'any' ident if the type is an empty interface.
+func (f *Formatter) toAnyIfEmptyInterface(expr dst.Expr) dst.Expr {
+	if iface, ok := expr.(*dst.InterfaceType); ok {
+		if iface.Methods == nil || len(iface.Methods.List) == 0 {
+			return &dst.Ident{Name: "any"}
+		}
+	}
+	return expr
 }
 
 // transformSpec processes a spec
@@ -467,6 +543,37 @@ func (f *Formatter) transformSpec(spec dst.Spec) {
 		}
 	case *dst.TypeSpec:
 		f.transformExpr(s.Type)
+	}
+}
+
+// transformBasicLit transforms basic literals (octal, etc.)
+func (f *Formatter) transformBasicLit(lit *dst.BasicLit) {
+	if lit.Kind != token.INT {
+		return
+	}
+
+	// Convert old-style octal literals (0644) to new style (0o644)
+	// Old style: starts with 0 and has only digits 0-7, length > 1
+	// New style: starts with 0o
+	value := lit.Value
+	if len(value) > 1 && value[0] == '0' {
+		// Check if it's already new style (0o, 0x, 0b)
+		if len(value) > 2 && (value[1] == 'o' || value[1] == 'O' || value[1] == 'x' || value[1] == 'X' || value[1] == 'b' || value[1] == 'B') {
+			return
+		}
+		// Check if it's an old-style octal (only digits 0-7)
+		isOctal := true
+		for i := 1; i < len(value); i++ {
+			c := value[i]
+			if c < '0' || c > '7' {
+				isOctal = false
+				break
+			}
+		}
+		if isOctal {
+			// Convert to new style: 0644 -> 0o644
+			lit.Value = "0o" + value[1:]
+		}
 	}
 }
 
@@ -930,11 +1037,73 @@ func (f *Formatter) normalizeTypeSpec(ts *dst.TypeSpec) {
 			return
 		}
 		f.shortenStructDef(ts, t)
+		f.alignStructTags(t)
 	case *dst.InterfaceType:
 		if t.Methods == nil || len(t.Methods.List) == 0 {
 			// Empty interface - already fine
 		}
 	}
+}
+
+// alignStructTags aligns struct tags by adding padding before each tag.
+func (f *Formatter) alignStructTags(structType *dst.StructType) {
+	if structType.Fields == nil || len(structType.Fields.List) == 0 {
+		return
+	}
+
+	// Only align if there are at least 2 fields with tags
+	fieldsWithTags := 0
+	for _, field := range structType.Fields.List {
+		if field.Tag != nil {
+			fieldsWithTags++
+		}
+	}
+	if fieldsWithTags < 2 {
+		return
+	}
+
+	// Calculate the max width of field name + type (before the tag)
+	maxWidth := 0
+	for _, field := range structType.Fields.List {
+		if field.Tag == nil {
+			continue
+		}
+		width := f.estimateFieldWidth(field)
+		if width > maxWidth {
+			maxWidth = width
+		}
+	}
+
+	// Add padding before each tag to align
+	for _, field := range structType.Fields.List {
+		if field.Tag == nil {
+			continue
+		}
+		width := f.estimateFieldWidth(field)
+		padding := maxWidth - width
+		if padding > 0 {
+			// Add space before the tag by prepending to Start decorations
+			field.Tag.Decs.Start = append(dst.Decorations{strings.Repeat(" ", padding+1)}, field.Tag.Decs.Start...)
+		}
+	}
+}
+
+// estimateFieldWidth estimates the visual width of a field (names + type).
+// Includes the space between field name and type.
+func (f *Formatter) estimateFieldWidth(field *dst.Field) int {
+	width := 0
+	for j, name := range field.Names {
+		width += len(name.Name)
+		if j < len(field.Names)-1 {
+			width += 2 // ", "
+		}
+	}
+	// Add 1 for the space between name and type
+	if len(field.Names) > 0 {
+		width += 1
+	}
+	width += f.estimateNodeWidth(field.Type)
+	return width
 }
 
 // shortenStructDef splits long struct type definitions across multiple lines.

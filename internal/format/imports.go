@@ -128,8 +128,16 @@ func (f *Formatter) collectPotentialPackageRefs(file *dst.File) map[string][]str
 }
 
 // collectSiblingGlobals finds all globals declared in sibling files.
+// Uses caching to avoid re-parsing the same directory multiple times.
 func (f *Formatter) collectSiblingGlobals(filename string, packageName string) map[string]bool {
 	dir := filepath.Dir(filename)
+
+	// Check cache first
+	if globals, ok := f.siblingCache[dir]; ok {
+		return globals
+	}
+
+	// Parse sibling files
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
@@ -168,6 +176,9 @@ func (f *Formatter) collectSiblingGlobals(filename string, packageName string) m
 			}
 		}
 	}
+
+	// Cache the result
+	f.siblingCache[dir] = globals
 	return globals
 }
 

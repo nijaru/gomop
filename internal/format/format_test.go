@@ -175,6 +175,67 @@ func main() {
 }
 `,
 		},
+		{
+			name: "octal_literal",
+			input: `package test
+
+func main() {
+	perm := 0644
+	_ = perm
+}
+`,
+			want: `package test
+
+func main() {
+	perm := 0o644
+	_ = perm
+}
+`,
+		},
+		{
+			name: "interface_to_any",
+			input: `package test
+
+func foo(x interface{}) interface{} {
+	return x
+}
+
+type T struct {
+	field interface{}
+}
+
+var v interface{}
+`,
+			want: `package test
+
+func foo(x any) any { return x }
+
+type T struct {
+	field any
+}
+
+var v any
+`,
+		},
+		{
+			name: "struct_tag_alignment",
+			input: `package test
+
+type Config struct {
+	Name string ` + "`" + `json:"name"` + "`" + `
+	Enabled bool ` + "`" + `json:"enabled"` + "`" + `
+	Port int ` + "`" + `json:"port"` + "`" + `
+}
+`,
+			want: `package test
+
+type Config struct {
+	Name    string ` + "`" + `json:"name"` + "`" + `
+	Enabled bool   ` + "`" + `json:"enabled"` + "`" + `
+	Port    int    ` + "`" + `json:"port"` + "`" + `
+}
+`,
+		},
 	}
 
 	for _, tt := range tests {
