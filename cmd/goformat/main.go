@@ -6,7 +6,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/alecthomas/kong"
 	"github.com/bmatcuk/doublestar/v4"
@@ -75,12 +77,42 @@ func main() {
 	}
 
 	exitCode := 0
-	for _, path := range expandedPaths {
-		if err := processPath(cli, path); err != nil {
-			fmt.Fprintf(os.Stderr, "error processing %s: %v\n", path, err)
+	numWorkers := runtime.NumCPU()
+	pathsChan := make(chan string, numWorkers*2)
+	errChan := make(chan error, numWorkers*2)
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for p := range pathsChan {
+				if err := processPath(cli, p); err != nil {
+					errChan <- fmt.Errorf("error processing %s: %v", p, err)
+				}
+			}
+		}()
+	}
+
+	// Feed paths
+	go func() {
+		for _, path := range expandedPaths {
+			pathsChan <- path
+		}
+		close(pathsChan)
+	}()
+
+	// Error collector
+	go func() {
+		for err := range errChan {
+			fmt.Fprintln(os.Stderr, err)
 			exitCode = 1
 		}
-	}
+	}()
+
+	wg.Wait()
+	close(errChan)
 	os.Exit(exitCode)
 }
 
@@ -114,29 +146,34 @@ func processPath(cli *CLI, path string) error {
 func processDir(cli *CLI, dir string) error {
 	return godirwalk.Walk(dir, &godirwalk.Options{
 		Callback: func(path string, de *godirwalk.Dirent) error {
-			// Skip directories
 			if de.IsDir() {
-				// Skip vendor and testdata directories
 				if de.Name() == "vendor" || de.Name() == "testdata" || strings.HasPrefix(de.Name(), ".") {
 					return filepath.SkipDir
 				}
 				return nil
 			}
 
-			// Only process Go files
 			if !strings.HasSuffix(path, ".go") {
 				return nil
 			}
 
-			// Get file mode
-			info, err := os.Stat(path)
-			if err != nil {
-				return err
+			// godirwalk provides the mode type, but for a full FileMode
+			// we still need a Stat if we want to preserve permissions (-w)
+			// But for just reading, we don't need it.
+			// However, since processFile needs mode for WriteFile, we keep it
+			// but we could optimize by only statting if cli.Write is true.
+			var mode os.FileMode = 0644
+			if cli.Write {
+				info, err := os.Stat(path)
+				if err != nil {
+					return err
+				}
+				mode = info.Mode()
 			}
 
-			return processFile(cli, path, info.Mode())
+			return processFile(cli, path, mode)
 		},
-		Unsorted: true, // Faster
+		Unsorted: true,
 	})
 }
 

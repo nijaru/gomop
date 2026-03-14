@@ -225,36 +225,28 @@ func (f *Formatter) transformDecl(decl dst.Decl) {
 
 // shortenFuncParams splits long function parameter lists
 func (f *Formatter) shortenFuncParams(fn *dst.FuncDecl) {
-	if fn.Type == nil || fn.Type.Params == nil {
+	if fn.Type == nil || fn.Type.Params == nil || len(fn.Type.Params.List) <= 1 {
 		return
 	}
 
-	params := fn.Type.Params
-	if len(params.List) <= 1 {
-		return
-	}
-
-	// Estimate parameter list width
-	width := 0
-	for _, field := range params.List {
-		for _, name := range field.Names {
-			width += len(name.Name) + 2 // name + ", "
-		}
-		// Add type width
-		width += f.estimateNodeWidth(field.Type) + 2 // type + ", "
-	}
-
-	// Add function name width
+	// Calculate total width once
+	width := (f.indent * f.opts.TabWidth) + 5 // "func "
 	if fn.Name != nil {
 		width += len(fn.Name.Name)
+	}
+	width += 2 // "()"
+
+	for i, field := range fn.Type.Params.List {
+		width += f.estimateNodeWidth(field)
+		if i < len(fn.Type.Params.List)-1 {
+			width += 2 // ", "
+		}
 	}
 
 	if width > f.opts.LineLength {
 		// Split parameters onto separate lines
-		for i, field := range params.List {
-			if i == 0 {
-				field.Decorations().Before = dst.NewLine
-			}
+		for _, field := range fn.Type.Params.List {
+			field.Decorations().Before = dst.NewLine
 			field.Decorations().After = dst.NewLine
 		}
 	}
@@ -410,64 +402,37 @@ func (f *Formatter) shortenCompositeLit(lit *dst.CompositeLit) {
 	}
 }
 
-// estimateNodeWidth estimates formatted width by counting tokens
+// estimateNodeWidth estimates formatted width of a node.
+// It is non-recursive to avoid O(N^2) complexity.
 func (f *Formatter) estimateNodeWidth(node dst.Node) int {
+	if node == nil {
+		return 0
+	}
 	width := 0
-
-	dst.Inspect(
-		node,
-		func(n dst.Node) bool {
-			switch v := n.(type) {
-			case *dst.Ident:
-				width += len(v.Name)
-			case *dst.BasicLit:
-				width += len(v.Value)
-			case *dst.BinaryExpr:
-				width += 3 // " op "
-			case *dst.CallExpr:
-				width += 2 // "()"
-				// Add commas between args
-				if len(v.Args) > 1 {
-					width += (len(v.Args) - 1) * 2 // ", " between args
-				}
-			case *dst.CompositeLit:
-				width += 2 // "{}"
-				if len(v.Elts) > 1 {
-					width += (len(v.Elts) - 1) * 2 // ", " between elements
-				}
-			case *dst.KeyValueExpr:
-				width += 2 // ": "
-			case *dst.SelectorExpr:
-				width += 1 // "."
-			case *dst.SliceExpr:
-				width += 2 // "[]"
-			case *dst.IndexExpr:
-				width += 2 // "[]"
-			case *dst.ArrayType:
-				width += 2 // "[]"
-			case *dst.MapType:
-				width += 5 // "map[]"
-			case *dst.FuncType:
-				width += 5 // "func()"
-			case *dst.InterfaceType:
-				width += 10 // "interface{}"
-			case *dst.StructType:
-				width += 8 // "struct{}"
-			case *dst.FuncLit:
-				width += 5 // "func()"
-			case *dst.Ellipsis:
-				width += 3 // "..."
-			case *dst.StarExpr:
-				width += 1 // "*"
-			case *dst.UnaryExpr:
-				width += 1 // operator
-			case *dst.ParenExpr:
-				width += 2 // "()"
-			}
+	dst.Inspect(node, func(n dst.Node) bool {
+		if n == nil {
 			return true
-		},
-	)
-
+		}
+		switch v := n.(type) {
+		case *dst.Ident:
+			width += len(v.Name)
+		case *dst.BasicLit:
+			width += len(v.Value)
+		case *dst.BinaryExpr:
+			width += 3 // " op "
+		case *dst.CallExpr:
+			width += 2                     // "()"
+			width += (len(v.Args) - 1) * 2 // ", "
+		case *dst.CompositeLit:
+			width += 2                     // "{}"
+			width += (len(v.Elts) - 1) * 2 // ", "
+		case *dst.KeyValueExpr:
+			width += 2 // ": "
+		case *dst.SelectorExpr:
+			width += 1 // "."
+		}
+		return true
+	})
 	return width
 }
 
