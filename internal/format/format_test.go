@@ -206,7 +206,7 @@ func main() {
 
 				if !bytes.Equal(formatted, gofmted) {
 					t.Errorf(
-						"Output not gofmt compatible:\n--- goformat\n+++ gofmt\n%s",
+						"Output not gofmt compatible:\n--- gomop\n+++ gofmt\n%s",
 						diff(string(formatted), string(gofmted)),
 					)
 				}

@@ -13,7 +13,7 @@ import (
 
 	"github.com/dave/dst"
 	"github.com/dave/dst/decorator"
-	"github.com/nijaru/goformat/internal/stdlib"
+	"github.com/nijaru/gomop/internal/stdlib"
 	"golang.org/x/tools/go/packages"
 )
 

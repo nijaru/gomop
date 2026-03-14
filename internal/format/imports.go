@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/dave/dst"
-	"github.com/nijaru/goformat/internal/stdlib"
+	"github.com/nijaru/gomop/internal/stdlib"
 )
 
 // fixImports adds missing imports, removes unused, and groups them.

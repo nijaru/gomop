@@ -8,7 +8,7 @@ import (
 
 func TestSiblingCheck(t *testing.T) {
 	// Create a temporary directory
-	tmpDir, err := os.MkdirTemp("", "goformat-test-*")
+	tmpDir, err := os.MkdirTemp("", "gomop-test-*")
 	if err != nil {
 		t.Fatal(err)
 	}

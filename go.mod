@@ -1,4 +1,4 @@
-module github.com/nijaru/goformat
+module github.com/nijaru/gomop
 
 go 1.26.1
 
