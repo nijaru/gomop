@@ -1,0 +1,50 @@
+package testdata
+
+// Test all formatting features
+import (
+	"bytes"
+	"fmt"
+)
+
+// Long function signature
+func ProcessData(
+	inputData string,
+	outputBuffer *bytes.Buffer,
+	config map[string]interface{},
+	errorHandler func(error),
+	logger interface{ Log(string) },
+) error {
+	return nil
+}
+
+// Long method chain
+func ChainExample() {
+	result := bytes.NewBuffer(nil).WriteString("hello world this is a very long string that exceeds limits").Error()
+	_ = result
+}
+
+// Nested structures
+type Config struct {
+	Name    string
+	Options map[string]string
+	Nested  struct {
+		Field1 string
+		Field2 int
+	}
+}
+
+// Method with unused import detection
+func main() { // Only fmt is used, others should be removed
+	fmt.Println("hello")
+
+	// Long composite literal
+	cfg := Config{
+		Name:    "test",
+		Options: map[string]string{"key1": "value1", "key2": "value2", "key3": "value3"},
+		Nested: struct {
+			Field1 string
+			Field2 int
+		}{"test", 42},
+	}
+	_ = cfg
+}

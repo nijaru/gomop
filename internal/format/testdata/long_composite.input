@@ -1,0 +1,7 @@
+package testdata
+
+// Long composite literal that should be split
+func Example() {
+	data := map[string]string{"first_key": "first_value_with_long_content", "second_key": "second_value_also_long", "third_key": "third_value_is_long_too"}
+	_ = data
+}
