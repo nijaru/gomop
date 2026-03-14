@@ -19,7 +19,10 @@ func ProcessData(
 
 // Long method chain
 func ChainExample() {
-	result := bytes.NewBuffer(nil).WriteString("hello world this is a very long string that exceeds limits").Error()
+	result := bytes.
+		NewBuffer(nil).
+		WriteString("hello world this is a very long string that exceeds limits").
+		Error()
 	_ = result
 }
 

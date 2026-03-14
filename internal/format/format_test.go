@@ -99,6 +99,82 @@ func main() {
 }
 `,
 		},
+		{
+			name: "short_case_clause",
+			input: `package test
+
+func main() {
+	switch c {
+	case 'a', 'b',
+		'c', 'd':
+		fmt.Println("short")
+	case 'x',
+		'y',
+		'z':
+		fmt.Println("also short")
+	default:
+		fmt.Println("default")
+	}
+}
+`,
+			want: `package test
+
+import "fmt"
+
+func main() {
+	switch c {
+	case 'a', 'b', 'c', 'd':
+		fmt.Println("short")
+	case 'x', 'y', 'z':
+		fmt.Println("also short")
+	default:
+		fmt.Println("default")
+	}
+}
+`,
+		},
+		{
+			name: "long_string_split",
+			input: `package test
+
+func main() {
+	msg := "this is a very long string that exceeds the maximum line length limit and should be split into multiple concatenated parts"
+	_ = msg
+}
+`,
+			want: `package test
+
+func main() {
+	msg := "this is a very long string that exceeds the maximum line length limit and should be" +
+		"split into multiple concatenated parts"
+	_ = msg
+}
+`,
+		},
+		{
+			name: "method_chain_split",
+			input: `package test
+
+import "bytes"
+
+func main() {
+	result := bytes.NewBuffer(nil).WriteString("hello world this is a very long string that exceeds limits").Error()
+	_ = result
+}
+`,
+			want: `package test
+
+import "bytes"
+
+func main() {
+	result := bytes.
+		NewBuffer(nil).
+		WriteString("hello world this is a very long string that exceeds limits").
+		Error()
+	_ = result
+}
+`,
+		},
 	}
 
 	for _, tt := range tests {

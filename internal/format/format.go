@@ -265,14 +265,35 @@ func (f *Formatter) transformBlockStmt(block *dst.BlockStmt) {
 func (f *Formatter) transformStmt(stmt dst.Stmt) {
 	switch s := stmt.(type) {
 	case *dst.AssignStmt:
-		for _, expr := range s.Rhs {
-			f.transformExpr(expr)
+		for i, expr := range s.Rhs {
+			// Check for method chain first
+			if f.isMethodChain(expr) {
+				s.Rhs[i] = f.shortenMethodChain(expr)
+			} else if split := f.splitLongString(expr, s.Lhs, s.Tok); split != nil {
+				// Check if this is a long string that needs splitting
+				s.Rhs[i] = split
+			} else {
+				f.transformExpr(expr)
+			}
 		}
 	case *dst.BlockStmt:
 		f.transformBlockStmt(s)
+	case *dst.CaseClause:
+		f.shortenCaseClause(s)
+		for _, stmt := range s.Body {
+			f.transformStmt(stmt)
+		}
+	case *dst.CommClause:
+		for _, stmt := range s.Body {
+			f.transformStmt(stmt)
+		}
 	case *dst.DeclStmt:
 		f.transformDecl(s.Decl)
 	case *dst.ExprStmt:
+		// Check for method chain in expression statements
+		if call, ok := s.X.(*dst.CallExpr); ok {
+			f.shortenMethodChain(call)
+		}
 		f.transformExpr(s.X)
 	case *dst.ForStmt:
 		if s.Body != nil {
@@ -288,14 +309,46 @@ func (f *Formatter) transformStmt(stmt dst.Stmt) {
 			f.transformBlockStmt(s.Body)
 		}
 	case *dst.ReturnStmt:
-		for _, expr := range s.Results {
-			f.transformExpr(expr)
+		for i, expr := range s.Results {
+			if f.isMethodChain(expr) {
+				s.Results[i] = f.shortenMethodChain(expr)
+			} else if split := f.splitLongString(expr, nil, 0); split != nil {
+				s.Results[i] = split
+			} else {
+				f.transformExpr(expr)
+			}
+		}
+	case *dst.SelectStmt:
+		if s.Body != nil {
+			f.indent++
+			for _, c := range s.Body.List {
+				if clause, ok := c.(*dst.CommClause); ok {
+					for _, stmt := range clause.Body {
+						f.transformStmt(stmt)
+					}
+				}
+			}
+			f.indent--
 		}
 	case *dst.SwitchStmt:
 		if s.Body != nil {
 			f.indent++
 			for _, c := range s.Body.List {
 				if clause, ok := c.(*dst.CaseClause); ok {
+					f.shortenCaseClause(clause)
+					for _, stmt := range clause.Body {
+						f.transformStmt(stmt)
+					}
+				}
+			}
+			f.indent--
+		}
+	case *dst.TypeSwitchStmt:
+		if s.Body != nil {
+			f.indent++
+			for _, c := range s.Body.List {
+				if clause, ok := c.(*dst.CaseClause); ok {
+					f.shortenCaseClause(clause)
 					for _, stmt := range clause.Body {
 						f.transformStmt(stmt)
 					}
@@ -384,6 +437,60 @@ func (f *Formatter) shortenCallExpr(call *dst.CallExpr) {
 	}
 }
 
+// shortenMethodChain splits long method chains across multiple lines.
+func (f *Formatter) shortenMethodChain(expr dst.Expr) dst.Expr {
+	// Check if this is a method chain and collect selectors
+	selectors := f.collectMethodChainSelectors(expr)
+	if len(selectors) <= 1 {
+		return expr
+	}
+
+	// Calculate total width
+	width := f.estimateNodeWidth(expr) + (f.indent * f.opts.TabWidth)
+	if width <= f.opts.LineLength {
+		return expr
+	}
+
+	// Split the chain by adding newlines before each selector's X
+	for _, sel := range selectors {
+		// Add newline before the dot
+		sel.Decs.X.Prepend("\n")
+	}
+
+	return expr
+}
+
+// isMethodChain checks if an expression is a method chain (2+ chained calls).
+func (f *Formatter) isMethodChain(expr dst.Expr) bool {
+	selectors := f.collectMethodChainSelectors(expr)
+	return len(selectors) >= 2
+}
+
+// collectMethodChainSelectors collects all SelectorExpr nodes in a method chain.
+func (f *Formatter) collectMethodChainSelectors(expr dst.Expr) []*dst.SelectorExpr {
+	var selectors []*dst.SelectorExpr
+	current := expr
+
+	for {
+		call, ok := current.(*dst.CallExpr)
+		if !ok {
+			break
+		}
+
+		sel, ok := call.Fun.(*dst.SelectorExpr)
+		if !ok {
+			break
+		}
+
+		selectors = append(selectors, sel)
+
+		// Move to the receiver (X) of the selector
+		current = sel.X
+	}
+
+	return selectors
+}
+
 // shortenCompositeLit breaks long composite literals across lines.
 func (f *Formatter) shortenCompositeLit(lit *dst.CompositeLit) {
 	if len(lit.Elts) <= 1 {
@@ -400,6 +507,159 @@ func (f *Formatter) shortenCompositeLit(lit *dst.CompositeLit) {
 			elt.Decorations().After = dst.NewLine
 		}
 	}
+}
+
+// shortenCaseClause collapses short case clauses onto a single line.
+// This implements gofumpt's "Short case clauses should take a single line" rule.
+func (f *Formatter) shortenCaseClause(clause *dst.CaseClause) {
+	if len(clause.List) == 0 {
+		return // default case
+	}
+
+	// Estimate width of case expressions: "case " + exprs + ":"
+	width := 6 // "case "
+	for i, expr := range clause.List {
+		width += f.estimateNodeWidth(expr)
+		if i < len(clause.List)-1 {
+			width += 2 // ", "
+		}
+	}
+	width += 1 // ":"
+
+	// Add indentation
+	width += f.indent * f.opts.TabWidth
+
+	// If it fits comfortably (with room for at least one body statement), collapse
+	if width < f.opts.LineLength-20 {
+		// Remove newlines between case expressions
+		for _, expr := range clause.List {
+			expr.Decorations().Before = dst.None
+			expr.Decorations().After = dst.None
+		}
+	}
+}
+
+// splitLongString splits a long string literal into concatenated parts.
+// Returns nil if the string doesn't need splitting.
+func (f *Formatter) splitLongString(expr dst.Expr, lhs []dst.Expr, tok token.Token) dst.Expr {
+	lit, ok := expr.(*dst.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return nil
+	}
+
+	// Calculate the line width including assignment
+	prefix := f.indent * f.opts.TabWidth
+	if lhs != nil && len(lhs) > 0 {
+		for _, l := range lhs {
+			prefix += f.estimateNodeWidth(l)
+		}
+		if tok == token.DEFINE {
+			prefix += 2 // ":="
+		} else {
+			prefix += 1 // "="
+		}
+		prefix += 1 // space
+	}
+
+	// Check if the string is too long
+	totalWidth := prefix + len(lit.Value)
+	if totalWidth <= f.opts.LineLength {
+		return nil
+	}
+
+	// Extract string content (without quotes)
+	raw := lit.Value
+	isRaw := strings.HasPrefix(raw, "`")
+	var content string
+	if isRaw {
+		content = strings.Trim(raw, "`")
+	} else {
+		content = strings.Trim(raw, `"`)
+		// Unescape basic sequences for length calculation
+		content = strings.ReplaceAll(content, `\n`, "\n")
+		content = strings.ReplaceAll(content, `\t`, "\t")
+	}
+
+	// Don't split raw strings or strings with newlines
+	if isRaw || strings.Contains(content, "\n") {
+		return nil
+	}
+
+	// Calculate how much space we have for each line
+	availableWidth := f.opts.LineLength - prefix - 2 // 2 for quotes
+
+	// Don't split if the available width is too small
+	if availableWidth < 20 {
+		return nil
+	}
+
+	// Split into chunks at word boundaries
+	chunks := f.splitStringAtWords(content, availableWidth)
+	if len(chunks) <= 1 {
+		return nil
+	}
+
+	// Build a binary expression tree of concatenated strings
+	var result dst.Expr
+	for i, chunk := range chunks {
+		part := &dst.BasicLit{
+			Kind:  token.STRING,
+			Value: `"` + chunk + `"`,
+		}
+		if i == 0 {
+			result = part
+		} else {
+			result = &dst.BinaryExpr{
+				Op: token.ADD,
+				X:  result,
+				Y:  part,
+			}
+			// Add newline before continuation
+			part.Decorations().Before = dst.NewLine
+		}
+	}
+
+	return result
+}
+
+// splitStringAtWords splits a string into chunks at word boundaries.
+func (f *Formatter) splitStringAtWords(s string, maxWidth int) []string {
+	if len(s) <= maxWidth {
+		return []string{s}
+	}
+
+	var chunks []string
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		// No spaces, just split at max width
+		for len(s) > maxWidth {
+			chunks = append(chunks, s[:maxWidth])
+			s = s[maxWidth:]
+		}
+		if len(s) > 0 {
+			chunks = append(chunks, s)
+		}
+		return chunks
+	}
+
+	var current strings.Builder
+	for _, word := range words {
+		if current.Len() == 0 {
+			current.WriteString(word)
+		} else if current.Len()+1+len(word) <= maxWidth {
+			current.WriteString(" ")
+			current.WriteString(word)
+		} else {
+			chunks = append(chunks, current.String())
+			current.Reset()
+			current.WriteString(word)
+		}
+	}
+	if current.Len() > 0 {
+		chunks = append(chunks, current.String())
+	}
+
+	return chunks
 }
 
 // estimateNodeWidth estimates formatted width of a node.

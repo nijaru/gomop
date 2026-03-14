@@ -1,12 +1,21 @@
 # gomop
 
+> ⚠️ **Early Development**: Expect bugs, missing features, and breaking changes. Not recommended for production use yet.
+
 A high-performance, unified Go formatter that combines `gofumpt`, `golines`, and `goimports` into a single tool.
 
 ## Features
 
 - **Import fixing** - Adds missing imports and removes unused ones
+- **Import grouping** - Strict 3-block grouping: stdlib, third-party, local
 - **Line shortening** - Splits long lines based on configurable width
-- **Strict formatting** - Applies `gofumpt` rules for consistent style
+  - Function calls and composite literals
+  - String literals (word-aware splitting)
+  - Method chains (dot-first style)
+- **gofumpt rules** - Stricter formatting for consistent style
+  - Short case clauses collapsed to single line
+  - No empty lines around function bodies
+  - Empty interfaces/structs on single line
 - **Single pass** - All transformations in one AST walk for speed
 - **Fast** - Sub-10ms formatting for typical files
 
