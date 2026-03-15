@@ -236,6 +236,47 @@ type Config struct {
 }
 `,
 		},
+		{
+			name: "multiline_top_level_decls",
+			input: `package test
+
+func foo() {
+	println(1)
+	println(2)
+}
+func bar() {
+	println(1)
+	println(2)
+}
+var (
+	a = 1
+)
+var b = 2
+func baz() { println(3) }
+func qux() { println(4) }
+`,
+			want: `package test
+
+func foo() {
+	println(1)
+	println(2)
+}
+
+func bar() {
+	println(1)
+	println(2)
+}
+
+var (
+	a = 1
+)
+
+var b = 2
+
+func baz() { println(3) }
+func qux() { println(4) }
+`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -415,10 +456,10 @@ func diff(a, b string) string {
 
 		if aLine != bLine {
 			if aLine != "" {
-				buf.WriteString(fmt.Sprintf("-%d: %s\n", i+1, aLine))
+				fmt.Fprintf(&buf, "-%d: %s\n", i+1, aLine)
 			}
 			if bLine != "" {
-				buf.WriteString(fmt.Sprintf("+%d: %s\n", i+1, bLine))
+				fmt.Fprintf(&buf, "+%d: %s\n", i+1, bLine)
 			}
 		}
 	}

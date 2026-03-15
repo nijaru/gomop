@@ -84,16 +84,14 @@ func main() {
 	var wg sync.WaitGroup
 
 	// Start workers
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range numWorkers {
+		wg.Go(func() {
 			for p := range pathsChan {
 				if err := processPath(cli, p); err != nil {
 					errChan <- fmt.Errorf("error processing %s: %v", p, err)
 				}
 			}
-		}()
+		})
 	}
 
 	// Feed paths

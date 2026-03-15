@@ -8,7 +8,6 @@ require (
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/dave/dst v0.27.3
 	github.com/karrick/godirwalk v1.17.0
-	github.com/mattn/go-colorable v0.1.14
 	github.com/mattn/go-isatty v0.0.20
 	golang.org/x/tools v0.43.0
 )

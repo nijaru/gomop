@@ -8,7 +8,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/dave/dst"
@@ -60,8 +60,7 @@ type Formatter struct {
 	indent      int                        // current indentation level
 
 	// siblingCache caches globals from sibling files (directory -> globals)
-	siblingCache   map[string]map[string]bool
-	siblingCacheDir string
+	siblingCache map[string]map[string]bool
 }
 
 
@@ -143,9 +142,6 @@ func (f *Formatter) loadTypeInfo(filename string, src []byte) error { // Create 
 	}
 
 	dir := filepath.Dir(filename)
-	if dir == "." {
-		dir = "."
-	}
 
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedImports |
@@ -712,7 +708,7 @@ func (f *Formatter) splitLongString(expr dst.Expr, lhs []dst.Expr, tok token.Tok
 
 	// Calculate the line width including assignment
 	prefix := f.indent * f.opts.TabWidth
-	if lhs != nil && len(lhs) > 0 {
+	if len(lhs) > 0 {
 		for _, l := range lhs {
 			prefix += f.estimateNodeWidth(l)
 		}
@@ -883,9 +879,9 @@ func (f *Formatter) groupImports(specs []*dst.ImportSpec) []*dst.ImportSpec {
 	}
 
 	// Sort each group
-	sort.Slice(std, f.byPath(std))
-	sort.Slice(thirdParty, f.byPath(thirdParty))
-	sort.Slice(local, f.byPath(local))
+	slices.SortFunc(std, f.cmpByPath)
+	slices.SortFunc(thirdParty, f.cmpByPath)
+	slices.SortFunc(local, f.cmpByPath)
 
 	var result []*dst.ImportSpec
 	result = append(result, std...)
@@ -905,10 +901,8 @@ func (f *Formatter) groupImports(specs []*dst.ImportSpec) []*dst.ImportSpec {
 	return result
 }
 
-func (f *Formatter) byPath(specs []*dst.ImportSpec) func(i, j int) bool {
-	return func(i, j int) bool {
-		return strings.Trim(specs[i].Path.Value, `"`) < strings.Trim(specs[j].Path.Value, `"`)
-	}
+func (f *Formatter) cmpByPath(a, b *dst.ImportSpec) int {
+	return strings.Compare(strings.Trim(a.Path.Value, `"`), strings.Trim(b.Path.Value, `"`))
 }
 
 // isStdLib checks if a path is a standard library package.
@@ -978,6 +972,9 @@ func (f *Formatter) applyGofumptRules(file *dst.File) {
 			f.normalizeGenDecl(d)
 		}
 	}
+
+	// Enforce empty lines between multiline top-level declarations
+	f.separateMultilineDecls(file.Decls)
 }
 
 // normalizeFuncDecl applies rules to function declarations.
@@ -1000,6 +997,107 @@ func (f *Formatter) normalizeFuncDecl(fn *dst.FuncDecl) {
 			// Add newline before closing paren
 		}
 	}
+}
+
+// separateMultilineDecls ensures top-level declarations that span multiple lines
+// have empty lines between them.
+func (f *Formatter) separateMultilineDecls(decls []dst.Decl) {
+	if len(decls) < 2 {
+		return
+	}
+
+	for i := 1; i < len(decls); i++ {
+		prev := decls[i-1]
+		curr := decls[i]
+
+		isPrevMulti := f.isMultilineDecl(prev)
+		isCurrMulti := f.isMultilineDecl(curr)
+
+		if isPrevMulti || isCurrMulti {
+			// Ensure empty line between them
+			// If previous is import, usually grouped, but wait: imports are already separated by fixImports
+			if !f.isImportDecl(prev) && !f.isImportDecl(curr) {
+				curr.Decorations().Before = dst.EmptyLine
+			}
+		}
+	}
+}
+
+func (f *Formatter) isImportDecl(decl dst.Decl) bool {
+	if gen, ok := decl.(*dst.GenDecl); ok && gen.Tok == token.IMPORT {
+		return true
+	}
+	return false
+}
+
+func (f *Formatter) hasNewlineSpace(space dst.SpaceType) bool {
+	return space == dst.NewLine || space == dst.EmptyLine
+}
+
+// isMultilineDecl determines if a declaration spans multiple lines.
+func (f *Formatter) isMultilineDecl(decl dst.Decl) bool {
+	switch d := decl.(type) {
+	case *dst.FuncDecl:
+		if d.Body != nil {
+			if len(d.Body.List) > 1 {
+				return true
+			}
+			if len(d.Body.List) == 1 {
+				stmt := d.Body.List[0]
+				if f.hasNewlineSpace(stmt.Decorations().Before) || f.hasNewlineSpace(stmt.Decorations().After) {
+					return true
+				}
+			}
+		}
+		// Check if params are multiline
+		if d.Type != nil && d.Type.Params != nil {
+			for _, p := range d.Type.Params.List {
+				if f.hasNewlineSpace(p.Decs.Before) || f.hasNewlineSpace(p.Decs.After) {
+					return true
+				}
+			}
+		}
+		return false
+	case *dst.GenDecl:
+		if d.Lparen {
+			// var (...) or type (...) or const (...) block
+			return true
+		}
+		
+		for _, spec := range d.Specs {
+			switch s := spec.(type) {
+			case *dst.TypeSpec:
+				switch t := s.Type.(type) {
+				case *dst.StructType:
+					if t.Fields != nil && len(t.Fields.List) > 0 {
+						return true
+					}
+				case *dst.InterfaceType:
+					if t.Methods != nil && len(t.Methods.List) > 0 {
+						return true
+					}
+				}
+			case *dst.ValueSpec:
+				for _, val := range s.Values {
+					if cl, ok := val.(*dst.CompositeLit); ok && len(cl.Elts) > 0 {
+						return true
+					}
+					if f.hasNewlineSpace(val.Decorations().Before) || f.hasNewlineSpace(val.Decorations().After) {
+						return true
+					}
+				}
+			}
+			if f.hasNewlineSpace(spec.Decorations().Before) || f.hasNewlineSpace(spec.Decorations().After) {
+				return true
+			}
+		}
+	}
+	
+	if f.hasNewlineSpace(decl.Decorations().Before) || f.hasNewlineSpace(decl.Decorations().After) {
+		return true
+	}
+	
+	return false
 }
 
 // normalizeGenDecl applies rules to generic declarations.
@@ -1182,8 +1280,4 @@ func (f *Formatter) shortenAnonymousStruct(structType *dst.StructType) {
 	}
 }
 
-// simplifyValueSpec simplifies variable specifications.
-func (f *Formatter) simplifyValueSpec(vs *dst.ValueSpec) {
-	// If single var with single value, could use :=
-	// (context-dependent, handled elsewhere)
-}
+

@@ -31,9 +31,7 @@ func diff(a, b []byte, path string) ([]byte, error) {
 // colorizeDiff applies ANSI colors to a unified diff.
 func colorizeDiff(diff string) string {
 	var result strings.Builder
-	lines := strings.Split(diff, "\n")
-
-	for _, line := range lines {
+	for line := range strings.SplitSeq(diff, "\n") {
 		switch {
 		case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---"):
 			result.WriteString(colorBold)
