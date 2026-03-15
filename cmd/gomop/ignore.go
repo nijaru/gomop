@@ -27,8 +27,20 @@ func newIgnoreMatcher(dir string) *ignoreMatcher {
 		rootDir: absDir,
 	}
 
-	// Load patterns from .gomopignore in the directory
-	im.loadPatterns(absDir)
+	// Load patterns from .gomopignore in the directory and parents
+	current := absDir
+	for {
+		im.loadPatterns(current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		// Stop at git root
+		if _, err := os.Stat(filepath.Join(current, ".git")); err == nil {
+			break
+		}
+		current = parent
+	}
 
 	return im
 }
