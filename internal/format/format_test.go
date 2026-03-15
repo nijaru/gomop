@@ -277,6 +277,59 @@ func baz() { println(3) }
 func qux() { println(4) }
 `,
 		},
+		{
+			name: "binary_expr_split",
+			input: `package test
+
+func main() {
+	if extremelyLengthyFirstConditionAlpha && extremelyLengthySecondConditionBeta && extremelyLengthyThirdConditionGamma {
+		println("yes")
+	}
+}
+`,
+			want: `package test
+
+func main() {
+	if extremelyLengthyFirstConditionAlpha &&
+		extremelyLengthySecondConditionBeta &&
+		extremelyLengthyThirdConditionGamma {
+		println("yes")
+	}
+}
+`,
+		},
+		{
+			name: "comment_whitespace",
+			input: `package test
+
+//this is a comment
+//this too
+//  already has spaces
+//go:generate echo hi
+//nolint:all
+func main() {}
+`,
+			want: `package test
+
+// this is a comment
+// this too
+//  already has spaces
+//go:generate echo hi
+//nolint:all
+func main() {}
+`,
+		},
+		{
+			name: "param_grouping",
+			input: `package test
+
+func foo(a int, b int, c string, d string) {}
+`,
+			want: `package test
+
+func foo(a, b int, c, d string) {}
+`,
+		},
 	}
 
 	for _, tt := range tests {

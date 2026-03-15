@@ -436,6 +436,7 @@ func (f *Formatter) transformExpr(expr dst.Expr) {
 			f.transformExpr(elt)
 		}
 	case *dst.BinaryExpr:
+		f.shortenBinaryExpr(e)
 		f.transformExpr(e.X)
 		f.transformExpr(e.Y)
 	case *dst.KeyValueExpr:
@@ -668,6 +669,35 @@ func (f *Formatter) shortenCompositeLit(lit *dst.CompositeLit) {
 	}
 }
 
+// shortenBinaryExpr splits long boolean expressions at && / || operators.
+func (f *Formatter) shortenBinaryExpr(expr *dst.BinaryExpr) {
+	// Only split on logical operators
+	if expr.Op != token.LAND && expr.Op != token.LOR {
+		return
+	}
+
+	// Check if the expression is too long
+	width := f.estimateNodeWidth(expr) + (f.indent * f.opts.TabWidth)
+	if width <= f.opts.LineLength {
+		return
+	}
+
+	// Split at every &&/|| in the chain by recursively marking right operands
+	f.splitLogicalChain(expr, expr.Op)
+}
+
+// splitLogicalChain marks newline splits at each logical operator matching op.
+func (f *Formatter) splitLogicalChain(expr dst.Expr, op token.Token) {
+	bin, ok := expr.(*dst.BinaryExpr)
+	if !ok || bin.Op != op {
+		return
+	}
+	// Recurse into the left side
+	f.splitLogicalChain(bin.X, op)
+	// Add newline before the right operand
+	bin.Y.Decorations().Before = dst.NewLine
+}
+
 // shortenCaseClause collapses short case clauses onto a single line.
 // This implements gofumpt's "Short case clauses should take a single line" rule.
 func (f *Formatter) shortenCaseClause(clause *dst.CaseClause) {
@@ -841,10 +871,14 @@ func (f *Formatter) estimateNodeWidth(node dst.Node) int {
 			width += 3 // " op "
 		case *dst.CallExpr:
 			width += 2                     // "()"
-			width += (len(v.Args) - 1) * 2 // ", "
+			if len(v.Args) > 1 {
+				width += (len(v.Args) - 1) * 2 // ", "
+			}
 		case *dst.CompositeLit:
 			width += 2                     // "{}"
-			width += (len(v.Elts) - 1) * 2 // ", "
+			if len(v.Elts) > 1 {
+				width += (len(v.Elts) - 1) * 2 // ", "
+			}
 		case *dst.KeyValueExpr:
 			width += 2 // ": "
 		case *dst.SelectorExpr:
@@ -975,6 +1009,9 @@ func (f *Formatter) applyGofumptRules(file *dst.File) {
 
 	// Enforce empty lines between multiline top-level declarations
 	f.separateMultilineDecls(file.Decls)
+
+	// Enforce comment whitespace
+	f.enforceCommentWhitespace(file)
 }
 
 // normalizeFuncDecl applies rules to function declarations.
@@ -989,14 +1026,8 @@ func (f *Formatter) normalizeFuncDecl(fn *dst.FuncDecl) {
 		fn.Body.List[len(fn.Body.List)-1].Decorations().After = dst.None
 	}
 
-	// Add newline between ) and { for multi-line params
-	if fn.Type.Params != nil && len(fn.Type.Params.List) > 0 {
-		// Check if params span multiple lines
-		// If so, ensure closing ) is on its own line
-		if len(fn.Type.Params.List) > 2 {
-			// Add newline before closing paren
-		}
-	}
+	// Group adjacent params with the same type
+	f.groupFuncParams(fn)
 }
 
 // separateMultilineDecls ensures top-level declarations that span multiple lines
@@ -1280,4 +1311,143 @@ func (f *Formatter) shortenAnonymousStruct(structType *dst.StructType) {
 	}
 }
 
+// enforceCommentWhitespace ensures comments have a space after // markers.
+// Skips go directives (//go:, //export, //nolint, //line, // +build, //build).
+func (f *Formatter) enforceCommentWhitespace(file *dst.File) {
+	dst.Inspect(file, func(n dst.Node) bool {
+		if n == nil {
+			return true
+		}
+		decs := n.Decorations()
+		f.fixDecsComments(decs.Start)
+		f.fixDecsComments(decs.End)
+		return true
+	})
+}
+
+// commentDirectives are prefixes that should not have a space inserted.
+var commentDirectives = []string{
+	"//go:",
+	"//export ",
+	"//nolint",
+	"//line ",
+	"// +build",
+	"//build ",
+}
+
+func (f *Formatter) fixDecsComments(decs dst.Decorations) {
+	for i, d := range decs {
+		if !strings.HasPrefix(d, "//") {
+			continue
+		}
+		// Skip directives
+		isDirective := false
+		for _, prefix := range commentDirectives {
+			if strings.HasPrefix(d, prefix) {
+				isDirective = true
+				break
+			}
+		}
+		if isDirective {
+			continue
+		}
+		// Fix missing space: //comment → // comment
+		if len(d) > 2 && d[2] != ' ' && d[2] != '\t' {
+			decs[i] = "// " + d[2:]
+		}
+	}
+}
+
+// groupFuncParams groups adjacent function parameters that share the same type.
+// e.g., func(a int, b int) → func(a, b int)
+func (f *Formatter) groupFuncParams(fn *dst.FuncDecl) {
+	if fn.Type == nil || fn.Type.Params == nil || len(fn.Type.Params.List) < 2 {
+		return
+	}
+
+	fields := fn.Type.Params.List
+	var grouped []*dst.Field
+
+	i := 0
+	for i < len(fields) {
+		current := fields[i]
+
+		// Look ahead for consecutive fields with the same type and no names in current
+		if len(current.Names) == 0 {
+			grouped = append(grouped, current)
+			i++
+			continue
+		}
+
+		// Collect consecutive fields with the same type
+		names := make([]*dst.Ident, len(current.Names))
+		copy(names, current.Names)
+
+		j := i + 1
+		for j < len(fields) {
+			next := fields[j]
+			if len(next.Names) == 0 {
+				break
+			}
+			if !f.sameType(current.Type, next.Type) {
+				break
+			}
+			names = append(names, next.Names...)
+			j++
+		}
+
+		if j > i+1 {
+			// We grouped some fields - create fresh field to avoid DST decoration bleed
+			newField := &dst.Field{
+				Names: names,
+				Type:  current.Type,
+			}
+			if current.Tag != nil {
+				newField.Tag = current.Tag
+			}
+			newField.Decs.Before = dst.None
+			newField.Decs.After = dst.None
+			grouped = append(grouped, newField)
+			i = j
+		} else {
+			grouped = append(grouped, current)
+			i++
+		}
+	}
+
+	if len(grouped) < len(fields) {
+		fn.Type.Params.List = grouped
+	}
+}
+
+// sameType checks if two type expressions are structurally equivalent.
+func (f *Formatter) sameType(a, b dst.Expr) bool {
+	switch ta := a.(type) {
+	case *dst.Ident:
+		if tb, ok := b.(*dst.Ident); ok {
+			return ta.Name == tb.Name
+		}
+	case *dst.SelectorExpr:
+		if tb, ok := b.(*dst.SelectorExpr); ok {
+			return f.sameType(ta.X, tb.X) && ta.Sel.Name == tb.Sel.Name
+		}
+	case *dst.StarExpr:
+		if tb, ok := b.(*dst.StarExpr); ok {
+			return f.sameType(ta.X, tb.X)
+		}
+	case *dst.ArrayType:
+		if tb, ok := b.(*dst.ArrayType); ok {
+			return f.sameType(ta.Elt, tb.Elt)
+		}
+	case *dst.MapType:
+		if tb, ok := b.(*dst.MapType); ok {
+			return f.sameType(ta.Key, tb.Key) && f.sameType(ta.Value, tb.Value)
+		}
+	case *dst.Ellipsis:
+		if tb, ok := b.(*dst.Ellipsis); ok {
+			return f.sameType(ta.Elt, tb.Elt)
+		}
+	}
+	return false
+}
 

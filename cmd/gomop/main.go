@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -199,6 +200,11 @@ func processFile(cli *CLI, path string, mode os.FileMode) error {
 		return err
 	}
 
+	// Skip generated files
+	if isGenerated(src) {
+		return nil
+	}
+
 	result, err := formatSource(cli, path, src)
 	if err != nil {
 		return err
@@ -226,4 +232,18 @@ func processFile(cli *CLI, path string, mode os.FileMode) error {
 	}
 
 	return nil
+}
+
+// generatedRx matches Go's standard generated file markers.
+// See https://go.dev/s/generatedcode
+var generatedRx = regexp.MustCompile(`(?m)^// Code generated .* DO NOT EDIT\.$`)
+
+// isGenerated reports whether src contains a Go generated file marker.
+func isGenerated(src []byte) bool {
+	// Only check the first 1KB to avoid scanning huge files
+	limit := len(src)
+	if limit > 1024 {
+		limit = 1024
+	}
+	return generatedRx.Match(src[:limit])
 }
