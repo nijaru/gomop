@@ -1,0 +1,836 @@
+package testdata
+
+// Large benchmark input file with diverse Go constructs.
+// Used to compare gomop vs goimports+golines+gofumpt pipeline.
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Config holds application configuration with many fields for struct benchmarking.
+type Config struct {
+	AppName        string            `json:"app_name" yaml:"app_name"`
+	Version        string            `json:"version" yaml:"version"`
+	Debug          bool              `json:"debug" yaml:"debug"`
+	Port           int               `json:"port" yaml:"port"`
+	ReadTimeout    time.Duration     `json:"read_timeout" yaml:"read_timeout"`
+	WriteTimeout   time.Duration     `json:"write_timeout" yaml:"write_timeout"`
+	MaxHeaderBytes int               `json:"max_header_bytes" yaml:"max_header_bytes"`
+	TLS            TLSConfig         `json:"tls" yaml:"tls"`
+	Database       DatabaseConfig    `json:"database" yaml:"database"`
+	Redis          RedisConfig       `json:"redis" yaml:"redis"`
+	Logging        LoggingConfig     `json:"logging" yaml:"logging"`
+	Middleware     []string          `json:"middleware" yaml:"middleware"`
+	Headers        map[string]string `json:"headers" yaml:"headers"`
+	Features       map[string]bool   `json:"features" yaml:"features"`
+	RateLimit      RateLimitConfig   `json:"rate_limit" yaml:"rate_limit"`
+	CORS           CORSConfig        `json:"cors" yaml:"cors"`
+}
+
+type TLSConfig struct {
+	Enabled  bool   `json:"enabled" yaml:"enabled"`
+	CertFile string `json:"cert_file" yaml:"cert_file"`
+	KeyFile  string `json:"key_file" yaml:"key_file"`
+}
+
+type DatabaseConfig struct {
+	Host            string        `json:"host" yaml:"host"`
+	Port            int           `json:"port" yaml:"port"`
+	Name            string        `json:"name" yaml:"name"`
+	User            string        `json:"user" yaml:"user"`
+	Password        string        `json:"password" yaml:"password"`
+	MaxOpenConns    int           `json:"max_open_conns" yaml:"max_open_conns"`
+	MaxIdleConns    int           `json:"max_idle_conns" yaml:"max_idle_conns"`
+	ConnMaxLifetime time.Duration `json:"conn_max_lifetime" yaml:"conn_max_lifetime"`
+	SSLMode         string        `json:"ssl_mode" yaml:"ssl_mode"`
+}
+
+type RedisConfig struct {
+	Addr     string `json:"addr" yaml:"addr"`
+	Password string `json:"password" yaml:"password"`
+	DB       int    `json:"db" yaml:"db"`
+	PoolSize int    `json:"pool_size" yaml:"pool_size"`
+}
+
+type LoggingConfig struct {
+	Level      string `json:"level" yaml:"level"`
+	Format     string `json:"format" yaml:"format"`
+	Output     string `json:"output" yaml:"output"`
+	MaxSize    int    `json:"max_size" yaml:"max_size"`
+	MaxBackups int    `json:"max_backups" yaml:"max_backups"`
+	MaxAge     int    `json:"max_age" yaml:"max_age"`
+	Compress   bool   `json:"compress" yaml:"compress"`
+}
+
+type RateLimitConfig struct {
+	Enabled           bool `json:"enabled" yaml:"enabled"`
+	RequestsPerSecond int  `json:"requests_per_second" yaml:"requests_per_second"`
+	BurstSize         int  `json:"burst_size" yaml:"burst_size"`
+}
+
+type CORSConfig struct {
+	Enabled          bool     `json:"enabled" yaml:"enabled"`
+	AllowedOrigins   []string `json:"allowed_origins" yaml:"allowed_origins"`
+	AllowedMethods   []string `json:"allowed_methods" yaml:"allowed_methods"`
+	AllowedHeaders   []string `json:"allowed_headers" yaml:"allowed_headers"`
+	ExposedHeaders   []string `json:"exposed_headers" yaml:"exposed_headers"`
+	AllowCredentials bool     `json:"allow_credentials" yaml:"allow_credentials"`
+	MaxAge           int      `json:"max_age" yaml:"max_age"`
+}
+
+// Server represents an HTTP server with middleware chain.
+type Server struct {
+	config     Config
+	router     *http.ServeMux
+	middleware []Middleware
+	pool       sync.Pool
+	client     *http.Client
+	logger     *log.Logger
+	mu         sync.RWMutex
+	routes     map[string]RouteInfo
+}
+
+type Middleware func(http.Handler) http.Handler
+
+type RouteInfo struct {
+	Method      string
+	Path        string
+	Handler     string
+	Middleware  []string
+	Description string
+}
+
+// NewServer creates a new server instance with the given configuration.
+func NewServer(cfg Config) (*Server, error) {
+	if cfg.AppName == "" {
+		return nil, fmt.Errorf("app name is required")
+	}
+	if cfg.Port <= 0 || cfg.Port > 65535 {
+		return nil, fmt.Errorf("invalid port number: %d, must be between 1 and 65535", cfg.Port)
+	}
+	if cfg.ReadTimeout <= 0 {
+		cfg.ReadTimeout = 30 * time.Second
+	}
+	if cfg.WriteTimeout <= 0 {
+		cfg.WriteTimeout = 30 * time.Second
+	}
+
+	s := &Server{
+		config: cfg,
+		router: http.NewServeMux(),
+		client: &http.Client{Timeout: cfg.ReadTimeout},
+		logger: log.New(os.Stderr, fmt.Sprintf("[%s] ", cfg.AppName), log.LstdFlags),
+		routes: make(map[string]RouteInfo),
+		pool: sync.Pool{
+			New: func() interface{} {
+				return new(bytes.Buffer)
+			},
+		},
+	}
+
+	return s, nil
+}
+
+// Use adds middleware to the server's middleware chain.
+func (s *Server) Use(mw ...Middleware) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.middleware = append(s.middleware, mw...)
+}
+
+// Handle registers a handler for the given pattern with middleware support.
+func (s *Server) Handle(pattern string, handler http.Handler, description string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var wrapped http.Handler = handler
+	for i := len(s.middleware) - 1; i >= 0; i-- {
+		wrapped = s.middleware[i](wrapped)
+	}
+
+	s.router.Handle(pattern, wrapped)
+	s.routes[pattern] = RouteInfo{
+		Method:      "ANY",
+		Path:        pattern,
+		Handler:     fmt.Sprintf("%T", handler),
+		Description: description,
+	}
+}
+
+// HandleFunc registers a handler function for the given pattern.
+func (s *Server) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request), description string) {
+	s.Handle(pattern, http.HandlerFunc(handler), description)
+}
+
+// ListenAndServe starts the HTTP server.
+func (s *Server) ListenAndServe() error {
+	addr := fmt.Sprintf(":%d", s.config.Port)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           s.router,
+		ReadTimeout:       s.config.ReadTimeout,
+		WriteTimeout:      s.config.WriteTimeout,
+		MaxHeaderBytes:    s.config.MaxHeaderBytes,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	s.logger.Printf("Starting server on %s (debug=%v)", addr, s.config.Debug)
+	return srv.ListenAndServe()
+}
+
+// ProcessRequest handles an incoming request with full pipeline.
+func (s *Server) ProcessRequest(ctx context.Context, r *http.Request) ([]byte, error) {
+	buf := s.pool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer s.pool.Put(buf)
+
+	reqID := r.Header.Get("X-Request-ID")
+	if reqID == "" {
+		reqID = fmt.Sprintf("req-%d", time.Now().UnixNano())
+	}
+
+	s.logger.Printf("[%s] %s %s from %s", reqID, r.Method, r.URL.Path, r.RemoteAddr)
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read request body for %s: %w", reqID, err)
+	}
+	defer r.Body.Close()
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON for %s: %w", reqID, err)
+	}
+
+	result, err := s.transformData(ctx, data, reqID)
+	if err != nil {
+		return nil, fmt.Errorf("transform failed for %s: %w", reqID, err)
+	}
+
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode response for %s: %w", reqID, err)
+	}
+
+	return encoded, nil
+}
+
+// transformData processes the input data through multiple transformation stages.
+func (s *Server) transformData(ctx context.Context, data map[string]interface{}, reqID string) (map[string]interface{}, error) {
+	result := make(map[string]interface{})
+
+	for key, value := range data {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("request %s cancelled during transform: %w", reqID, ctx.Err())
+		default:
+		}
+
+		switch v := value.(type) {
+		case string:
+			result[key] = strings.TrimSpace(strings.ToLower(v))
+		case float64:
+			result[key] = v
+		case bool:
+			result[key] = v
+		case []interface{}:
+			result[key] = s.processSlice(ctx, v, fmt.Sprintf("%s.%s", reqID, key))
+		case map[string]interface{}:
+			nested, err := s.transformData(ctx, v, fmt.Sprintf("%s.%s", reqID, key))
+			if err != nil {
+				return nil, err
+			}
+			result[key] = nested
+		default:
+			result[key] = v
+		}
+	}
+
+	return result, nil
+}
+
+// processSlice handles array transformation with type coercion.
+func (s *Server) processSlice(ctx context.Context, items []interface{}, path string) []interface{} {
+	result := make([]interface{}, 0, len(items))
+	for i, item := range items {
+		select {
+		case <-ctx.Done():
+			return result
+		default:
+		}
+
+		switch v := item.(type) {
+		case string:
+			result = append(result, strings.TrimSpace(v))
+		case map[string]interface{}:
+			nested, err := s.transformData(ctx, v, fmt.Sprintf("%s[%d]", path, i))
+			if err != nil {
+				s.logger.Printf("warning: transform error at %s[%d]: %v", path, i, err)
+				continue
+			}
+			result = append(result, nested)
+		default:
+			result = append(result, v)
+		}
+	}
+	return result
+}
+
+// LoadConfig reads and parses a configuration file.
+func LoadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file %s: %w", path, err)
+	}
+
+	ext := filepath.Ext(path)
+	switch ext {
+	case ".json":
+		return parseJSONConfig(data)
+	case ".yaml", ".yml":
+		return parseYAMLConfig(data)
+	default:
+		return nil, fmt.Errorf("unsupported config format: %s", ext)
+	}
+}
+
+func parseJSONConfig(data []byte) (*Config, error) {
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("invalid JSON config: %w", err)
+	}
+	return &cfg, nil
+}
+
+func parseYAMLConfig(data []byte) (*Config, error) {
+	// Simplified YAML parsing - in production use gopkg.in/yaml.v3
+	var cfg Config
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		switch key {
+		case "app_name":
+			cfg.AppName = val
+		case "version":
+			cfg.Version = val
+		case "debug":
+			cfg.Debug = val == "true"
+		}
+	}
+	return &cfg, nil
+}
+
+// BatchProcessor handles concurrent batch processing of items.
+type BatchProcessor struct {
+	workers    int
+	batchSize  int
+	retries    int
+	timeout    time.Duration
+	onSuccess  func(item interface{}, result interface{})
+	onError    func(item interface{}, err error)
+	onComplete func(processed int, failed int, duration time.Duration)
+}
+
+// NewBatchProcessor creates a processor with the given concurrency settings.
+func NewBatchProcessor(workers, batchSize, retries int, timeout time.Duration) *BatchProcessor {
+	if workers <= 0 {
+		workers = 4
+	}
+	if batchSize <= 0 {
+		batchSize = 100
+	}
+	if retries < 0 {
+		retries = 0
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	return &BatchProcessor{
+		workers:   workers,
+		batchSize: batchSize,
+		retries:   retries,
+		timeout:   timeout,
+	}
+}
+
+// Process executes the batch processing pipeline.
+func (bp *BatchProcessor) Process(ctx context.Context, items []interface{}, fn func(context.Context, interface{}) (interface{}, error)) (int, int, error) {
+	start := time.Now()
+	total := len(items)
+	processed := 0
+	failed := 0
+
+	batches := make([][]interface{}, 0, (total+bp.batchSize-1)/bp.batchSize)
+	for i := 0; i < total; i += bp.batchSize {
+		end := i + bp.batchSize
+		if end > total {
+			end = total
+		}
+		batches = append(batches, items[i:end])
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	sem := make(chan struct{}, bp.workers)
+	errs := make([]error, 0)
+
+	for _, batch := range batches {
+		wg.Go(func() {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			for _, item := range batch {
+				var result interface{}
+				var err error
+
+				for attempt := 0; attempt <= bp.retries; attempt++ {
+					itemCtx, cancel := context.WithTimeout(ctx, bp.timeout)
+					result, err = fn(itemCtx, item)
+					cancel()
+
+					if err == nil {
+						break
+					}
+
+					if attempt < bp.retries {
+						backoff := time.Duration(1<<uint(attempt)) * 100 * time.Millisecond
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(backoff):
+						}
+					}
+				}
+
+				mu.Lock()
+				if err != nil {
+					failed++
+					errs = append(errs, err)
+					if bp.onError != nil {
+						bp.onError(item, err)
+					}
+				} else {
+					processed++
+					if bp.onSuccess != nil {
+						bp.onSuccess(item, result)
+					}
+				}
+				mu.Unlock()
+			}
+		})
+	}
+
+	wg.Wait()
+
+	duration := time.Since(start)
+	if bp.onComplete != nil {
+		bp.onComplete(processed, failed, duration)
+	}
+
+	if len(errs) > 0 {
+		return processed, failed, fmt.Errorf("batch completed with %d errors (first: %w)", len(errs), errs[0])
+	}
+
+	return processed, failed, nil
+}
+
+// SortAndFilter demonstrates sorting and filtering patterns.
+func SortAndFilter(items []Config, sortBy string, minPort int, hasTLS bool) []Config {
+	filtered := make([]Config, 0, len(items))
+	for _, item := range items {
+		if item.Port < minPort {
+			continue
+		}
+		if hasTLS && !item.TLS.Enabled {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+
+	sort.Slice(filtered, func(i, j int) bool {
+		switch sortBy {
+		case "name":
+			return strings.Compare(filtered[i].AppName, filtered[j].AppName) < 0
+		case "port":
+			return filtered[i].Port < filtered[j].Port
+		case "version":
+			return strings.Compare(filtered[i].Version, filtered[j].Version) < 0
+		default:
+			return filtered[i].AppName < filtered[j].AppName
+		}
+	})
+
+	return filtered
+}
+
+// RetryableHTTPClient wraps http.Client with retry logic.
+type RetryableHTTPClient struct {
+	client    *http.Client
+	maxRetry  int
+	backoff   time.Duration
+	retryOn   []int
+	onRetry   func(attempt int, resp *http.Response, err error)
+}
+
+// NewRetryableHTTPClient creates a client that retries failed requests.
+func NewRetryableHTTPClient(timeout time.Duration, maxRetry int, backoff time.Duration) *RetryableHTTPClient {
+	return &RetryableHTTPClient{
+		client: &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: 10 * time.Second,
+			},
+		},
+		maxRetry: maxRetry,
+		backoff:  backoff,
+		retryOn:  []int{500, 502, 503, 504},
+	}
+}
+
+// Do executes an HTTP request with retries.
+func (c *RetryableHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	var lastResp *http.Response
+	var lastErr error
+
+	for attempt := 0; attempt <= c.maxRetry; attempt++ {
+		if attempt > 0 {
+			delay := c.backoff * time.Duration(1<<uint(attempt-1))
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(delay):
+			}
+		}
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			lastErr = err
+			if c.onRetry != nil {
+				c.onRetry(attempt, nil, err)
+			}
+			continue
+		}
+
+		shouldRetry := false
+		for _, code := range c.retryOn {
+			if resp.StatusCode == code {
+				shouldRetry = true
+				break
+			}
+		}
+
+		if !shouldRetry {
+			return resp, nil
+		}
+
+		resp.Body.Close()
+		lastResp = resp
+		lastErr = fmt.Errorf("server returned %d", resp.StatusCode)
+
+		if c.onRetry != nil {
+			c.onRetry(attempt, resp, nil)
+		}
+	}
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("request failed after %d retries: %w", c.maxRetry, lastErr)
+	}
+	return lastResp, nil
+}
+
+// Event represents a typed event in the system.
+type Event struct {
+	ID        string                 `json:"id"`
+	Type      string                 `json:"type"`
+	Source    string                 `json:"source"`
+	Timestamp time.Time              `json:"timestamp"`
+	Data      map[string]interface{} `json:"data"`
+	Metadata  map[string]string      `json:"metadata,omitempty"`
+}
+
+// EventBus manages event publishing and subscription.
+type EventBus struct {
+	mu          sync.RWMutex
+	subscribers map[string][]chan Event
+	bufferSize  int
+	closed      bool
+}
+
+// NewEventBus creates an event bus with the given buffer size.
+func NewEventBus(bufferSize int) *EventBus {
+	return &EventBus{
+		subscribers: make(map[string][]chan Event),
+		bufferSize:  bufferSize,
+	}
+}
+
+// Subscribe registers a handler for the given event type.
+func (eb *EventBus) Subscribe(eventType string) (<-chan Event, func()) {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+
+	ch := make(chan Event, eb.bufferSize)
+	eb.subscribers[eventType] = append(eb.subscribers[eventType], ch)
+
+	unsubscribe := func() {
+		eb.mu.Lock()
+		defer eb.mu.Unlock()
+
+		subs := eb.subscribers[eventType]
+		for i, sub := range subs {
+			if sub == ch {
+				eb.subscribers[eventType] = append(subs[:i], subs[i+1:]...)
+				close(ch)
+				break
+			}
+		}
+	}
+
+	return ch, unsubscribe
+}
+
+// Publish sends an event to all subscribers of its type.
+func (eb *EventBus) Publish(event Event) {
+	eb.mu.RLock()
+	defer eb.mu.RUnlock()
+
+	if eb.closed {
+		return
+	}
+
+	if subs, ok := eb.subscribers[event.Type]; ok {
+		for _, ch := range subs {
+			select {
+			case ch <- event:
+			default:
+				log.Printf("warning: subscriber channel full, dropping event %s", event.ID)
+			}
+		}
+	}
+}
+
+// Close shuts down the event bus and closes all subscriber channels.
+func (eb *EventBus) Close() {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+
+	if eb.closed {
+		return
+	}
+	eb.closed = true
+
+	for eventType, subs := range eb.subscribers {
+		for _, ch := range subs {
+			close(ch)
+		}
+		delete(eb.subscribers, eventType)
+	}
+}
+
+// WorkerPool manages a pool of goroutines for concurrent task execution.
+type WorkerPool struct {
+	size      int
+	taskQueue chan func()
+	wg        sync.WaitGroup
+	started   bool
+	mu        sync.Mutex
+}
+
+// NewWorkerPool creates a worker pool with the given size.
+func NewWorkerPool(size int, queueSize int) *WorkerPool {
+	if size <= 0 {
+		size = runtime.NumCPU()
+	}
+	if queueSize <= 0 {
+		queueSize = size * 2
+	}
+
+	return &WorkerPool{
+		size:      size,
+		taskQueue: make(chan func(), queueSize),
+	}
+}
+
+// Start begins processing tasks from the queue.
+func (wp *WorkerPool) Start() {
+	wp.mu.Lock()
+	defer wp.mu.Unlock()
+
+	if wp.started {
+		return
+	}
+	wp.started = true
+
+	for i := 0; i < wp.size; i++ {
+		wp.wg.Go(func() {
+			for task := range wp.taskQueue {
+				task()
+			}
+		})
+	}
+}
+
+// Submit adds a task to the worker pool queue.
+func (wp *WorkerPool) Submit(task func()) error {
+	wp.mu.Lock()
+	if !wp.started {
+		wp.mu.Unlock()
+		return fmt.Errorf("worker pool not started")
+	}
+	wp.mu.Unlock()
+
+	select {
+	case wp.taskQueue <- task:
+		return nil
+	default:
+		return fmt.Errorf("worker pool queue full")
+	}
+}
+
+// Stop gracefully shuts down the worker pool.
+func (wp *WorkerPool) Stop() {
+	wp.mu.Lock()
+	if !wp.started {
+		wp.mu.Unlock()
+		return
+	}
+	wp.started = false
+	wp.mu.Unlock()
+
+	close(wp.taskQueue)
+	wp.wg.Wait()
+}
+
+// Cache provides a thread-safe in-memory cache with TTL support.
+type Cache struct {
+	mu       sync.RWMutex
+	items    map[string]cacheItem
+	maxSize  int
+	defaultTTL time.Duration
+}
+
+type cacheItem struct {
+	value      interface{}
+	expiration time.Time
+	accessed   time.Time
+}
+
+// NewCache creates a cache with the given capacity and default TTL.
+func NewCache(maxSize int, defaultTTL time.Duration) *Cache {
+	c := &Cache{
+		items:      make(map[string]cacheItem),
+		maxSize:    maxSize,
+		defaultTTL: defaultTTL,
+	}
+	go c.evictionLoop()
+	return c
+}
+
+func (c *Cache) evictionLoop() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		c.evict()
+	}
+}
+
+func (c *Cache) evict() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	for key, item := range c.items {
+		if now.After(item.expiration) {
+			delete(c.items, key)
+		}
+	}
+}
+
+// Get retrieves a value from the cache.
+func (c *Cache) Get(key string) (interface{}, bool) {
+	c.mu.RLock()
+	item, ok := c.items[key]
+	c.mu.RUnlock()
+
+	if !ok {
+		return nil, false
+	}
+
+	if time.Now().After(item.expiration) {
+		c.mu.Lock()
+		delete(c.items, key)
+		c.mu.Unlock()
+		return nil, false
+	}
+
+	c.mu.Lock()
+	item.accessed = time.Now()
+	c.items[key] = item
+	c.mu.Unlock()
+
+	return item.value, true
+}
+
+// Set stores a value in the cache with the default TTL.
+func (c *Cache) Set(key string, value interface{}) {
+	c.SetWithTTL(key, value, c.defaultTTL)
+}
+
+// SetWithTTL stores a value with a specific TTL.
+func (c *Cache) SetWithTTL(key string, value interface{}, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(c.items) >= c.maxSize {
+		c.evictLRU()
+	}
+
+	c.items[key] = cacheItem{
+		value:      value,
+		expiration: time.Now().Add(ttl),
+		accessed:   time.Now(),
+	}
+}
+
+func (c *Cache) evictLRU() {
+	var oldestKey string
+	var oldestAccess time.Time
+
+	for key, item := range c.items {
+		if oldestKey == "" || item.accessed.Before(oldestAccess) {
+			oldestKey = key
+			oldestAccess = item.accessed
+		}
+	}
+
+	if oldestKey != "" {
+		delete(c.items, oldestKey)
+	}
+}
