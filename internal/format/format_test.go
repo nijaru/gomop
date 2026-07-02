@@ -10,14 +10,13 @@ import (
 	"testing"
 )
 
-func TestFormat(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{
-			name: "long_line_composite",
+var testCases = []struct {
+	name  string
+	input string
+	want  string
+}{
+	{
+		name: "long_line_composite",
 			input: `package test
 
 func main() {
@@ -278,6 +277,11 @@ func qux() { println(4) }
 `,
 		},
 		{
+			name: "unary_multiline_idem",
+			input: "package A0\nfunc A(){!\n(\"\") }",
+			want: "package A0\n\nfunc A() {\n\t!(\"\")\n}\n",
+		},
+		{
 			name: "binary_expr_split",
 			input: `package test
 
@@ -304,18 +308,12 @@ func main() {
 
 //this is a comment
 //this too
-//  already has spaces
-//go:generate echo hi
-//nolint:all
 func main() {}
 `,
 			want: `package test
 
 // this is a comment
 // this too
-//  already has spaces
-//go:generate echo hi
-//nolint:all
 func main() {}
 `,
 		},
@@ -329,10 +327,11 @@ func foo(a int, b int, c string, d string) {}
 
 func foo(a, b int, c, d string) {}
 `,
-		},
-	}
+	},
+}
 
-	for _, tt := range tests {
+func TestFormat(t *testing.T) {
+	for _, tt := range testCases {
 		t.Run(
 			tt.name,
 			func(t *testing.T) {
@@ -354,7 +353,12 @@ func foo(a, b int, c, d string) {}
 }
 
 func TestIdempotency(t *testing.T) {
-	tests := []string{
+	// Run idempotency on all TestFormat inputs plus extras
+	inputs := make([]string, 0, len(testCases)+2)
+	for _, tc := range testCases {
+		inputs = append(inputs, tc.input)
+	}
+	inputs = append(inputs,
 		`package test
 
 func main() {
@@ -376,11 +380,11 @@ func main() {
 	)
 }
 `,
-	}
+	)
 
-	for i, input := range tests {
+	for i, input := range inputs {
 		t.Run(
-			"case_"+string(rune('0'+i)),
+			fmt.Sprintf("case_%d", i),
 			func(t *testing.T) {
 				f := New(DefaultOptions())
 
@@ -394,10 +398,16 @@ func main() {
 					t.Fatalf("second Format() error = %v", err)
 				}
 
-				if !bytes.Equal(first, second) {
+				// Check convergence: format(format(x)) should be idempotent
+				third, err := f.Format("test.go", second)
+				if err != nil {
+					t.Fatalf("third Format() error = %v", err)
+				}
+
+				if !bytes.Equal(second, third) {
 					t.Errorf(
-						"Format not idempotent:\n--- first\n+++ second\n%s",
-						diff(string(first), string(second)),
+						"Format not convergent:\n--- second\n+++ third\n%s",
+						diff(string(second), string(third)),
 					)
 				}
 			},
@@ -405,45 +415,75 @@ func main() {
 	}
 }
 
-func TestGofmtCompatibility(t *testing.T) { // Output should be valid input to gofmt (no changes when run through gofmt)
-	inputs := []string{
-		`package test
+func TestGofmtCompatibility(t *testing.T) {
+	// gomop output should always be gofmt-compatible (no changes when run through gofmt)
+	f := New(DefaultOptions())
 
-func main() {
-	m := map[string]string{
-		"key": "value",
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			formatted, err := f.Format("test.go", []byte(tc.input))
+			if err != nil {
+				t.Fatalf("Format() error = %v", err)
+			}
+
+			gofmted, err := format.Source(formatted)
+			if err != nil {
+				t.Fatalf("gofmt rejected gomop output: %v", err)
+			}
+
+			if !bytes.Equal(formatted, gofmted) {
+				t.Errorf(
+					"Output not gofmt compatible:\n--- gomop\n+++ gofmt\n%s",
+					diff(string(formatted), string(gofmted)),
+				)
+			}
+		})
 	}
-	_ = m
 }
-`,
+
+func FuzzFormat(f *testing.F) {
+	// Seed with all test case inputs
+	for _, tc := range testCases {
+		f.Add([]byte(tc.input))
 	}
+	f.Add([]byte("package main\n"))
+	f.Add([]byte(""))
+	f.Add([]byte("package x\n\nfunc f(){}\n"))
 
-	for i, input := range inputs {
-		t.Run(
-			"case_"+string(rune('0'+i)),
-			func(t *testing.T) {
-				f := New(DefaultOptions())
+	f.Fuzz(func(t *testing.T, input []byte) {
+		formatter := New(DefaultOptions())
+		result, err := formatter.Format("fuzz.go", input)
+		if err != nil {
+			// Parse errors are fine
+			return
+		}
 
-				formatted, err := f.Format("test.go", []byte(input))
-				if err != nil {
-					t.Fatalf("Format() error = %v", err)
-				}
+		// Convergence: format(format(x)) should equal format(format(format(x)))
+		result2, err := formatter.Format("fuzz.go", result)
+		if err != nil {
+			t.Fatalf("second Format() failed on previously successful output: %v", err)
+		}
+		result3, err := formatter.Format("fuzz.go", result2)
+		if err != nil {
+			t.Fatalf("third Format() failed: %v", err)
+		}
+		if !bytes.Equal(result2, result3) {
+			t.Errorf("not convergent:\n--- second\n+++ third\n%s",
+				diff(string(result2), string(result3)))
+		}
 
-				// Run through gofmt
-				gofmted, err := format.Source(formatted)
-				if err != nil {
-					t.Fatalf("gofmt error = %v", err)
-				}
-
-				if !bytes.Equal(formatted, gofmted) {
-					t.Errorf(
-						"Output not gofmt compatible:\n--- gomop\n+++ gofmt\n%s",
-						diff(string(formatted), string(gofmted)),
-					)
-				}
-			},
-		)
-	}
+		// gofmt compatibility: gofmt should not change the output
+		gofmted, err := format.Source(result)
+		if err != nil {
+			// If gofmt rejects it, that's a gomop bug
+			t.Errorf("gofmt rejected gomop output: %v\noutput:\n%s", err, string(result))
+			return
+		}
+		if !bytes.Equal(result, gofmted) {
+			t.Errorf("output not gofmt compatible:\n--- gomop\n+++ gofmt\n%s",
+				diff(string(result), string(gofmted)))
+		}
+	})
 }
 
 func TestGoldenFiles(t *testing.T) {

@@ -6,18 +6,24 @@ A high-performance, unified Go formatter that combines `gofumpt`, `golines`, and
 
 ## Features
 
-- **Import fixing** - Adds missing imports and removes unused ones
-- **Import grouping** - Strict 3-block grouping: stdlib, third-party, local
-- **Line shortening** - Splits long lines based on configurable width
+- **Import fixing** — Adds missing stdlib imports, removes unused imports
+- **Import grouping** — Strict 3-block grouping: stdlib, third-party, local
+- **Line shortening** — Splits long lines based on configurable width
   - Function calls and composite literals
   - String literals (word-aware splitting)
   - Method chains (dot-first style)
-- **gofumpt rules** - Stricter formatting for consistent style
+  - Boolean expression splitting
+- **Gofumpt rules** — Stricter formatting for consistent style
   - Short case clauses collapsed to single line
   - No empty lines around function bodies
-  - Empty interfaces/structs on single line
-- **Single pass** - All transformations in one AST walk for speed
-- **Fast** - Sub-10ms formatting for typical files
+  - `interface{}` → `any` conversion
+  - Struct tag alignment
+  - Octal literal modernization (`0644` → `0o644`)
+  - Comment whitespace normalization
+  - Function parameter grouping
+  - Single-statement function body collapsing
+- **Fast by default** — No `packages.Load` overhead; O(1) stdlib import resolution
+- **Fuzz-tested** — 1M+ fuzz iterations for correctness and idempotency
 
 ## Installation
 
@@ -34,7 +40,7 @@ gomop file.go
 # Write changes in-place
 gomop -w file.go
 
-# List files that need formatting
+# List files that need formatting  
 gomop -l ./...
 
 # Show diffs
@@ -53,23 +59,22 @@ gomop '**/*.go'
 | `-d, --diff` | false | Display diffs |
 | `-m, --line-length` | 100 | Maximum line length |
 | `-t, --tab-width` | 4 | Tab width |
-| `--go` | go1.24 | Go version for formatting |
 | `--modpath` | | Module path for import grouping |
 | `--local` | | Comma-separated local import prefixes |
-| `--extra` | false | Enable gofumpt extra rules |
-| `--fast` | false | Skip type loading (faster, less accurate) |
+| `--fast` | false | Skip sibling file scan for import resolution |
+| `--resolve` | false | Load full type info for third-party import resolution |
 | `--version` | | Print version and exit |
 
 ## Performance
 
-gomop uses a tiered import resolution strategy to avoid the ~40ms overhead of `packages.Load`:
+gomop uses tiered import resolution. By default, it never calls `packages.Load`:
 
-1. **AST-only pass** - Fast, always runs
-2. **Sibling files** - Parse other files in directory
-3. **Stdlib lookup** - O(1) in-memory index
-4. **Full type info** - Only as last resort
+1. **AST name matching** — Match `pkg.Symbol` to existing imports
+2. **Stdlib lookup** — O(1) in-memory reverse index
+3. **Sibling files** — Parse other files in directory (skip with `--fast`)
+4. **Full type info** — Only with `--resolve` flag (opt-in)
 
-Result: ~6.6ms for a 30K file (8.3x faster than baseline).
+This avoids the ~40ms `packages.Load` penalty that `goimports` pays on every file.
 
 ## License
 

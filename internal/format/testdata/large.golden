@@ -315,7 +315,8 @@ func parseJSONConfig(data []byte) (*Config, error) {
 	return &cfg, nil
 }
 
-func parseYAMLConfig(data []byte) (*Config, error) { // Simplified YAML parsing - in production use gopkg.in/yaml.v3
+func parseYAMLConfig(data []byte) (*Config, error) {
+	// Simplified YAML parsing - in production use gopkg.in/yaml.v3
 	var cfg Config
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {

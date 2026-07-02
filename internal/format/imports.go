@@ -8,17 +8,21 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/dave/dst"
 	"github.com/nijaru/gomop/internal/stdlib"
+	"golang.org/x/tools/go/packages"
 )
 
 // fixImports adds missing imports, removes unused, and groups them.
+// Uses tiered resolution: AST matching → stdlib manifest → sibling scan.
+// Does NOT use packages.Load — that's goimports' job.
 func (f *Formatter) fixImports(filename string, file *dst.File) {
 	// 1. Collect existing imports
-	importPaths := make(map[string]string) // name -> path
-	importNames := make(map[string]string) // path -> name
+	importPaths := make(map[string]string) // name → path
+	importNames := make(map[string]string) // path → name
 
 	for _, decl := range file.Decls {
 		if gen, ok := decl.(*dst.GenDecl); ok && gen.Tok == token.IMPORT {
@@ -38,12 +42,12 @@ func (f *Formatter) fixImports(filename string, file *dst.File) {
 		}
 	}
 
-	// 2. Collect all references (pkg.Name)
-	refs := f.collectPotentialPackageRefs(file)
+	// 2. Use references collected during the transform walk
+	refs := f.packageRefs
 
 	// 3. Determine used imports and potential missing ones
 	usedImports := make(map[string]bool)
-	unresolved := make(map[string][]string) // pkgName -> [symbols...]
+	unresolved := make(map[string][]string)
 
 	for pkgName, symbols := range refs {
 		if path, ok := importPaths[pkgName]; ok {
@@ -53,11 +57,10 @@ func (f *Formatter) fixImports(filename string, file *dst.File) {
 		}
 	}
 
-	// 4. Resolve missing imports from stdlib
+	// 4. Resolve missing imports from stdlib (O(1) manifest lookup)
 	for pkgName, symbols := range unresolved {
 		if path := f.resolveStdlib(pkgName, symbols); path != "" {
 			if _, exists := f.imports[path]; !exists {
-				// Create new import spec
 				spec := &dst.ImportSpec{
 					Path: &dst.BasicLit{Kind: token.STRING, Value: fmt.Sprintf("%q", path)},
 				}
@@ -68,34 +71,31 @@ func (f *Formatter) fixImports(filename string, file *dst.File) {
 		}
 	}
 
-	// 5. Tier 2: Check siblings for unresolved symbols
-	if len(unresolved) > 0 {
+	// 5. Check siblings for unresolved symbols (may be local package globals).
+	// Skip if Fast mode is enabled.
+	if len(unresolved) > 0 && !f.opts.Fast {
 		globals := f.collectSiblingGlobals(filename, file.Name.Name)
 		for pkgName := range unresolved {
 			if globals[pkgName] {
-				// It's a global from a sibling file, not a package call
 				delete(unresolved, pkgName)
 			}
 		}
 	}
 
-	// 6. Tier 3: If we still have unresolved and haven't loaded type info, consider it
-	if len(unresolved) > 0 && f.pkg == nil && !f.opts.SkipTypeInfo {
-		// Fallback to packages.Load if we have unresolved imports that are not in stdlib
-		// or if we want to be more accurate.
-		// For now, let's trigger it.
-		if err := f.loadTypeInfo(filename, nil); err == nil {
-			// Second pass: use type info to resolve package names
-			if f.pkg != nil && f.pkg.TypesInfo != nil {
-				for _, obj := range f.pkg.TypesInfo.Uses {
-					if pkgName, ok := obj.(*types.PkgName); ok {
-						path := pkgName.Imported().Path()
-						usedImports[path] = true
-					}
-				}
+	// 6. Full type resolution (opt-in via --resolve). Uses packages.Load
+	// for third-party import detection. Off by default to avoid the ~40ms overhead.
+	if len(unresolved) > 0 && f.opts.Resolve {
+		resolved := f.resolveTypeInfo(filename)
+		for pkgName := range unresolved {
+			if path, ok := resolved[pkgName]; ok {
+				usedImports[path] = true
+				delete(unresolved, pkgName)
 			}
 		}
 	}
+
+	// Remaining unresolved are third-party packages — don't auto-add them.
+	// Existing imports matched by name are kept; unmatched ones are removed.
 
 	// 7. Build new import list
 	var newImports []*dst.ImportSpec
@@ -105,39 +105,44 @@ func (f *Formatter) fixImports(filename string, file *dst.File) {
 		}
 	}
 
-	// Sort and group imports
 	newImports = f.groupImports(newImports)
-
-	// Replace imports in file
 	f.replaceImports(file, newImports)
 }
 
-// collectPotentialPackageRefs finds all pkg.Name references.
-func (f *Formatter) collectPotentialPackageRefs(file *dst.File) map[string][]string {
-	refs := make(map[string][]string)
-	dst.Inspect(file, func(node dst.Node) bool {
-		if sel, ok := node.(*dst.SelectorExpr); ok {
-			if ident, ok := sel.X.(*dst.Ident); ok {
-				// Potential package reference
-				refs[ident.Name] = append(refs[ident.Name], sel.Sel.Name)
-			}
+// resolveTypeInfo uses packages.Load to resolve third-party package names
+// to their import paths. Only called when --resolve is enabled.
+func (f *Formatter) resolveTypeInfo(filename string) map[string]string {
+	dir := filepath.Dir(filename)
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedImports |
+			packages.NeedTypes | packages.NeedTypesInfo,
+		Dir: dir,
+	}
+	pkgs, err := packages.Load(cfg, "file="+filename)
+	if err != nil || len(pkgs) == 0 {
+		return nil
+	}
+	if pkgs[0].TypesInfo == nil {
+		return nil
+	}
+
+	resolved := make(map[string]string)
+	for _, obj := range pkgs[0].TypesInfo.Uses {
+		if pn, ok := obj.(*types.PkgName); ok {
+			resolved[pn.Name()] = pn.Imported().Path()
 		}
-		return true
-	})
-	return refs
+	}
+	return resolved
 }
 
 // collectSiblingGlobals finds all globals declared in sibling files.
 // Uses caching to avoid re-parsing the same directory multiple times.
 func (f *Formatter) collectSiblingGlobals(filename string, packageName string) map[string]bool {
 	dir := filepath.Dir(filename)
-
-	// Check cache first
 	if globals, ok := f.siblingCache[dir]; ok {
 		return globals
 	}
 
-	// Parse sibling files
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
@@ -147,12 +152,13 @@ func (f *Formatter) collectSiblingGlobals(filename string, packageName string) m
 	fset := token.NewFileSet()
 
 	for _, fi := range files {
-		if fi.IsDir() || !strings.HasSuffix(fi.Name(), ".go") || fi.Name() == filepath.Base(filename) || strings.HasSuffix(fi.Name(), "_test.go") {
+		if fi.IsDir() || !strings.HasSuffix(fi.Name(), ".go") ||
+			fi.Name() == filepath.Base(filename) ||
+			strings.HasSuffix(fi.Name(), "_test.go") {
 			continue
 		}
 
 		path := filepath.Join(dir, fi.Name())
-		// Only parse top-level declarations
 		node, err := parser.ParseFile(fset, path, nil, parser.DeclarationErrors)
 		if err != nil || node.Name.Name != packageName {
 			continue
@@ -177,7 +183,6 @@ func (f *Formatter) collectSiblingGlobals(filename string, packageName string) m
 		}
 	}
 
-	// Cache the result
 	f.siblingCache[dir] = globals
 	return globals
 }
@@ -188,7 +193,6 @@ func (f *Formatter) resolveStdlib(pkgName string, symbols []string) string {
 	if len(candidates) == 0 {
 		return ""
 	}
-
 	for _, path := range candidates {
 		pkgSymbols := stdlib.PackageSymbols[path]
 		allFound := true
@@ -209,10 +213,97 @@ func (f *Formatter) resolveStdlib(pkgName string, symbols []string) string {
 			return path
 		}
 	}
-
 	return ""
 }
 
 func (f *Formatter) getAssumedName(path string) string {
 	return stdlib.GetAssumedName(path)
+}
+
+// =============================================================================
+// Import Grouping
+// =============================================================================
+
+func (f *Formatter) groupImports(specs []*dst.ImportSpec) []*dst.ImportSpec {
+	var std, thirdParty, local []*dst.ImportSpec
+
+	for _, spec := range specs {
+		spec.Decorations().Before = dst.None
+		spec.Decorations().After = dst.None
+		path := strings.Trim(spec.Path.Value, `"`)
+		if f.isStdLib(path) {
+			std = append(std, spec)
+		} else if f.isLocal(path) {
+			local = append(local, spec)
+		} else {
+			thirdParty = append(thirdParty, spec)
+		}
+	}
+
+	slices.SortFunc(std, f.cmpByPath)
+	slices.SortFunc(thirdParty, f.cmpByPath)
+	slices.SortFunc(local, f.cmpByPath)
+
+	var result []*dst.ImportSpec
+	result = append(result, std...)
+	if len(std) > 0 && (len(thirdParty) > 0 || len(local) > 0) {
+		std[len(std)-1].Decorations().After = dst.EmptyLine
+	}
+	result = append(result, thirdParty...)
+	if len(thirdParty) > 0 && len(local) > 0 {
+		thirdParty[len(thirdParty)-1].Decorations().After = dst.EmptyLine
+	}
+	result = append(result, local...)
+	return result
+}
+
+func (f *Formatter) cmpByPath(a, b *dst.ImportSpec) int {
+	return strings.Compare(
+		strings.Trim(a.Path.Value, `"`),
+		strings.Trim(b.Path.Value, `"`),
+	)
+}
+
+func (f *Formatter) isStdLib(path string) bool {
+	return stdlib.HasPackage(path)
+}
+
+func (f *Formatter) isLocal(path string) bool {
+	for _, prefix := range f.opts.LocalPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	if f.opts.ModulePath != "" && strings.HasPrefix(path, f.opts.ModulePath) {
+		return true
+	}
+	return false
+}
+
+func (f *Formatter) replaceImports(file *dst.File, specs []*dst.ImportSpec) {
+	var decls []dst.Decl
+	var importDecl *dst.GenDecl
+
+	for _, decl := range file.Decls {
+		if gen, ok := decl.(*dst.GenDecl); ok && gen.Tok == token.IMPORT {
+			if importDecl == nil {
+				importDecl = gen
+				importDecl.Specs = nil
+			}
+		} else {
+			decls = append(decls, decl)
+		}
+	}
+
+	if len(specs) > 0 {
+		if importDecl == nil {
+			importDecl = &dst.GenDecl{Tok: token.IMPORT}
+		}
+		for _, spec := range specs {
+			importDecl.Specs = append(importDecl.Specs, spec)
+		}
+		file.Decls = append([]dst.Decl{importDecl}, decls...)
+	} else {
+		file.Decls = decls
+	}
 }

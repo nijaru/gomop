@@ -37,7 +37,8 @@ type Config struct {
 }
 
 // Method with unused import detection
-func main() { // Only fmt is used, others should be removed
+func main() {
+	// Only fmt is used, others should be removed
 	fmt.Println("hello")
 
 	// Long composite literal

@@ -29,11 +29,10 @@ type CLI struct {
 	Diff          bool     `help:"display diffs instead of rewriting files" short:"d"`
 	LineLength    int      `help:"maximum line length" short:"m" default:"100"`
 	TabWidth      int      `help:"tab width" short:"t" default:"4"`
-	GoVersion     string   `help:"Go version for formatting (e.g., go1.24)" name:"go"`
 	ModulePath    string   `help:"module path for import grouping" name:"modpath"`
 	LocalPrefixes []string `help:"comma-separated local import prefixes" name:"local" sep:","`
-	ExtraRules    bool     `help:"enable gofumpt extra rules" name:"extra"`
-	Fast          bool     `help:"skip type loading (faster, less accurate imports)" name:"fast"`
+	Fast          bool     `help:"skip sibling scan for import resolution" name:"fast"`
+	Resolve       bool     `help:"load full type info for third-party import resolution" name:"resolve"`
 	Version       kong.VersionFlag `help:"print version and exit" name:"version" vars:"version=${version}"`
 
 	Paths []string `arg:"" optional:"" help:"Paths to format (directories or files)."`
@@ -125,11 +124,10 @@ func formatSource(cli *CLI, filename string, src []byte) ([]byte, error) {
 	opts := format.Options{
 		LineLength:    cli.LineLength,
 		TabWidth:      cli.TabWidth,
-		GoVersion:     cli.GoVersion,
 		ModulePath:    modPath,
 		LocalPrefixes: cli.LocalPrefixes,
-		ExtraRules:    cli.ExtraRules,
-		SkipTypeInfo:  cli.Fast,
+		Fast:          cli.Fast,
+		Resolve:       cli.Resolve,
 	}
 
 	f := format.New(opts)
